@@ -95,6 +95,30 @@ An Active Directory-aware RDS session manager. Lets you browse RDS servers by cl
 
 ---
 
+## RhinoShadow
+
+**`RhinoShadow/RhinoShadow.ps1`**
+
+A polished fork of Shadow User, rebuilt for the common workflow: *"User X just called me — which RDS server are they on, and can I sign them out?"* Same core functionality as the original, plus a stack of UX and performance improvements.
+
+**What's new vs Shadow User:**
+- **Quick Find** — type a username, press Enter, and it searches every RDS server across every client OU **in parallel** (runspace pool, ~2s vs ~15s+ sequentially). The headline feature.
+- **Robust session parsing** — fixed a bug where the original silently dropped disconnected sessions (the ones you most often want to log off).
+- **Sessions grid** — Username, State, Idle, Logon Time, Server, Session ID, Session Name. Click headers to sort. Live filter box for substring matching across Username/Server/State.
+- **State colouring** — Active sessions in green, Disconnected in amber, errors in red.
+- **Action buttons** — Shadow, Sign Out, Send Message, Refresh, all themed and labelled clearly.
+- **Status log** — timestamped activity feed at the bottom so you can see what was queried and what came back.
+- **Dark / light theme toggle** — matches the RhinoCopy design language.
+- **Double-click to shadow** — matches RDP-console muscle memory.
+- **Rhino mascot** — click for escalating moods.
+- **In-app help dialog**, **crash log** to `%TEMP%\RhinoShadow_crash.log`.
+
+The original Browse-by-Client flow is preserved as a secondary panel — pick an OU, tick servers, hit Show Sessions.
+
+*Forked by Jared from the original Shadow User. Requires the same domain access.*
+
+---
+
 ## Requirements
 
 All tools require Windows with PowerShell and .NET / WinForms available (standard on any domain-joined Windows machine). Shadow User additionally requires network access to the RDS servers and permission to run `query user` and `logoff` remotely.
