@@ -119,6 +119,14 @@ The original Browse-by-Client flow is preserved as a secondary panel — pick an
 
 ---
 
+## Shared
+
+**`Shared/SecretRhinoMessages.ps1`**
+
+A standalone, drop-in code block containing the full Rhino mascot easter-egg messages — three escalating mood arrays (friendly / irritated / blanket statements) plus the click handler. Copy-paste it into any Rhino-themed tool to give the mascot a personality. Currently used by RhinoCopy and RhinoShadow; RhinoCopy is the canonical source of truth for message edits.
+
+---
+
 ## Requirements
 
 All tools require Windows with PowerShell and .NET / WinForms available (standard on any domain-joined Windows machine). Shadow User additionally requires network access to the RDS servers and permission to run `query user` and `logoff` remotely.
