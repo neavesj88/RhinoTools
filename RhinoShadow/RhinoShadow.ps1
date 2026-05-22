@@ -266,6 +266,11 @@ $script:adRoot = "OU=RDS Servers,OU=Servers,DC=focusnet,DC=net,DC=au"
 # used to them not appearing.
 $script:serverExcludePattern = "*sh77*"
 
+# Domain root for user searches - derived from adRoot by stripping the OU
+# components and keeping only the DC parts. Used by Resolve-RhinoUsernames
+# to search the whole directory for matching accounts.
+$script:domainRoot = ($script:adRoot -split ',' | Where-Object { $_ -match '^DC=' }) -join ','
+
 # Cache of "all servers across all OUs". Populated on first Quick Find so
 # we don't re-enumerate AD every search. Null = not yet populated.
 $script:allServersCache = $null
@@ -337,7 +342,7 @@ function Get-RhinoServers {
         $result.Dispose(); $searcher.Dispose(); $entry.Dispose()
     } catch {
         if (Get-Command Write-RhinoLog -ErrorAction SilentlyContinue) {
-            Write-RhinoLog "AD error enumerating servers: $_" "error"
+            Write-RhinoLog "AD error enumerating servers in '$adPath': $_" "error"
         }
     }
     # Apply the legacy exclusion. -notlike returns true for non-matches.
@@ -368,7 +373,53 @@ function Get-AllRhinoServers {
     return $script:allServersCache
 }
 
-# 5d - Parse-QuserLine
+# 5d - Resolve-RhinoUsernames
+# ----------------------------
+# Given a freetext search term, query AD for matching user accounts and
+# return their SAM account names. Searches across:
+#   - sAMAccountName  (login name, e.g. rdisilvio_mpm)
+#   - displayName     (e.g. "Rose Di Silvio")
+#   - givenName       (first name)
+#   - sn              (surname)
+#   - userPrincipalName (UPN prefix, e.g. rdisilvio_mpm@focusnet.net.au)
+#
+# Returns an array of sAMAccountName strings. If AD is unreachable or the
+# search fails, returns an empty array so the caller falls back to raw
+# username matching.
+function Resolve-RhinoUsernames {
+    param([string]$term)
+    $samNames = @()
+    try {
+        $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://" + $script:domainRoot)
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
+        # OR filter across all name-like attributes. Wildcards on both sides
+        # so "rose" matches "Alex Rose", "rdisilvio", "Rose Di Silvio", etc.
+        $escaped = $term -replace '\(','\\28' -replace '\)','\\29' -replace '\\','\\5c' -replace '\*','\\2a'
+        $searcher.Filter = "(|" +
+            "(sAMAccountName=*$escaped*)" +
+            "(displayName=*$escaped*)" +
+            "(givenName=*$escaped*)" +
+            "(sn=*$escaped*)" +
+            "(userPrincipalName=*$escaped*)" +
+            ")"
+        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $searcher.PropertiesToLoad.Add("sAMAccountName") | Out-Null
+        $searcher.SizeLimit = 200
+        $result = $searcher.FindAll()
+        foreach ($obj in $result) {
+            $sam = $obj.Properties['sAMAccountName']
+            if ($sam -and $sam.Count -gt 0) { $samNames += $sam[0].ToString() }
+        }
+        $result.Dispose(); $searcher.Dispose(); $entry.Dispose()
+    } catch {
+        if (Get-Command Write-RhinoLog -ErrorAction SilentlyContinue) {
+            Write-RhinoLog "AD user lookup failed, falling back to raw match: $_" "warn"
+        }
+    }
+    return $samNames
+}
+
+# 5e - Parse-QuserLine  (was 5d)
 # --------------------
 # Parse a single line of `query user` output into a session object.
 # Returns $null for header lines / blank lines / unparseable lines.
@@ -381,54 +432,48 @@ function Get-AllRhinoServers {
 # the ones the IT team needs to find and log off, so missing them was a
 # real bug.
 #
-# Here we parse by FIXED COLUMN POSITIONS instead. `query user` always
-# pads its output to the same column widths:
+# Here we parse with a TOKEN-BASED REGEX. The previous version used fixed
+# Substring() column positions, but quser's column widths drift slightly
+# between Windows Server versions and locales - a 1-character shift was
+# enough to extract "Active" into the SessionID slot, which then caused
+# `logoff` to silently fail with "no such session". The regex below anchors
+# on two things that are stable regardless of column widths:
+#   - STATE is one of a known keyword set (Active, Disc, Listen, ...)
+#   - SessionID is always pure digits
+# The optional SESSIONNAME group + regex backtracking handles the gap that
+# Disconnected sessions leave.
 #
 #  USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME
 # >jneaves               rdp-tcp#1           5  Active        .   11/21 9:00 AM
 #  bobsmith                                  7  Disc       1:23   11/21 8:45 AM
-#  ^column 1                                 ^col 42         ^col 54  ^col 65
 #
-# This parser is resilient to the SESSIONNAME column being blank.
+# Returns $null for header / blank / unparseable lines.
 function Parse-QuserLine {
     param([string]$line, [string]$server)
-    # Skip blanks and the header line that quser always emits first.
     if ([string]::IsNullOrWhiteSpace($line)) { return $null }
     if ($line -match '^\s*USERNAME') { return $null }
-    # quser prefixes the current console user's line with ">". Strip it for
-    # display but remember the column positions don't shift - the ">" sits
-    # in column 0 where a space would otherwise be.
-    $isCurrent = $line.StartsWith('>')
-    $clean = if ($isCurrent) { ' ' + $line.Substring(1) } else { $line }
-    # Defensive: require enough characters to hold a logon time at the end.
-    if ($clean.Length -lt 65) { return $null }
-    try {
-        $username    = $clean.Substring(1, 22).Trim()
-        $sessionName = $clean.Substring(23, 18).Trim()
-        $idText      = $clean.Substring(41, 5).Trim()
-        $state       = $clean.Substring(46, 8).Trim()
-        $idleTime    = $clean.Substring(54, 11).Trim()
-        $logonTime   = $clean.Substring(65).Trim()
-    } catch {
-        return $null
-    }
-    if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($idText)) {
-        return $null
-    }
+    # ">" prefix marks the current console user. Strip it so the regex
+    # doesn't have to know about it.
+    $isCurrent = $line -match '^\s*>'
+    $work = $line -replace '^\s*>\s*', ''
+    # Anchors on STATE being a known keyword + ID being pure digits.
+    # The optional (?:\s+(?<session>\S+))? handles both Active sessions
+    # (SESSIONNAME present) and Disc ones (SESSIONNAME blank) via backtrack.
+    $pattern = '^\s*(?<user>\S+)(?:\s+(?<session>\S+))?\s+(?<id>\d+)\s+(?<state>Active|Disc|Listen|Conn|ConnQ|Shadow|Reset|Down|Init|Idle)\s+(?<idle>\S+)\s+(?<logon>.+?)\s*$'
+    if ($work -notmatch $pattern) { return $null }
     return [PSCustomObject]@{
-        Username    = $username
-        SessionName = $sessionName
-        SessionID   = $idText
-        State       = $state
-        IdleTime    = $idleTime
-        LogonTime   = $logonTime
+        Username    = $Matches['user']
+        SessionName = if ($Matches['session']) { $Matches['session'] } else { '' }
+        SessionID   = $Matches['id']
+        State       = $Matches['state']
+        IdleTime    = $Matches['idle']
+        LogonTime   = $Matches['logon'].Trim()
         Server      = $server
         IsCurrent   = $isCurrent
     }
 }
 
-# 5e - Get-RhinoSessions
-# ----------------------
+# 5f - Get-RhinoSessions  (was 5e)
 # Query session info from a list of servers IN PARALLEL using a runspace
 # pool. This is the headline performance win over the original script.
 #
@@ -454,31 +499,24 @@ function Get-RhinoSessions {
     # scope. So we inline a copy of the parser here.
     $workerScript = {
         param($server)
-        # Inline parser - same logic as Parse-QuserLine, duplicated because
-        # runspaces don't inherit functions from the parent scope.
+        # Inline parser - same logic as Parse-QuserLine. Duplicated because
+        # runspaces don't inherit functions from the parent scope. Keep
+        # this in sync with Parse-QuserLine above.
         function Parse-Line {
             param([string]$line, [string]$srv)
             if ([string]::IsNullOrWhiteSpace($line)) { return $null }
             if ($line -match '^\s*USERNAME') { return $null }
-            $isCurrent = $line.StartsWith('>')
-            $clean = if ($isCurrent) { ' ' + $line.Substring(1) } else { $line }
-            if ($clean.Length -lt 65) { return $null }
-            try {
-                $username    = $clean.Substring(1, 22).Trim()
-                $sessionName = $clean.Substring(23, 18).Trim()
-                $idText      = $clean.Substring(41, 5).Trim()
-                $state       = $clean.Substring(46, 8).Trim()
-                $idleTime    = $clean.Substring(54, 11).Trim()
-                $logonTime   = $clean.Substring(65).Trim()
-            } catch { return $null }
-            if ([string]::IsNullOrWhiteSpace($username)) { return $null }
+            $isCurrent = $line -match '^\s*>'
+            $work = $line -replace '^\s*>\s*', ''
+            $pattern = '^\s*(?<user>\S+)(?:\s+(?<session>\S+))?\s+(?<id>\d+)\s+(?<state>Active|Disc|Listen|Conn|ConnQ|Shadow|Reset|Down|Init|Idle)\s+(?<idle>\S+)\s+(?<logon>.+?)\s*$'
+            if ($work -notmatch $pattern) { return $null }
             return [PSCustomObject]@{
-                Username    = $username
-                SessionName = $sessionName
-                SessionID   = $idText
-                State       = $state
-                IdleTime    = $idleTime
-                LogonTime   = $logonTime
+                Username    = $Matches['user']
+                SessionName = if ($Matches['session']) { $Matches['session'] } else { '' }
+                SessionID   = $Matches['id']
+                State       = $Matches['state']
+                IdleTime    = $Matches['idle']
+                LogonTime   = $Matches['logon'].Trim()
                 Server      = $srv
                 IsCurrent   = $isCurrent
             }
@@ -551,8 +589,8 @@ try {
     # ------------------------------------------------------------------
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "RhinoShadow v1.0"
-    $form.MinimumSize = New-Object System.Drawing.Size(950, 750)
-    $form.Size = New-Object System.Drawing.Size(1050, 800)
+    $form.MinimumSize = New-Object System.Drawing.Size(950, 780)
+    $form.Size = New-Object System.Drawing.Size(1050, 830)
     $form.StartPosition = "CenterScreen"
     $form.Font = $fontRegular
     $form.AutoScaleMode = 'Font'
@@ -622,7 +660,7 @@ try {
     $themeButton.Text = "Light"
     $themeButton.Size = New-Object System.Drawing.Size(70, 28)
     $themeButton.Anchor = 'Top,Right'
-    $themeButton.Location = New-Object System.Drawing.Point($headerPanel.Width - 165, 20)
+    $themeButton.Location = New-Object System.Drawing.Point(885, 20)
     Apply-ButtonTheme -Button $themeButton -Role "btn-neutral"
     $headerPanel.Controls.Add($themeButton)
     Register-Themed -Control $themeButton -Role "btn-neutral"
@@ -644,7 +682,7 @@ try {
     $helpButton.Text = "?"
     $helpButton.Size = New-Object System.Drawing.Size(32, 28)
     $helpButton.Anchor = 'Top,Right'
-    $helpButton.Location = New-Object System.Drawing.Point($headerPanel.Width - 90, 20)
+    $helpButton.Location = New-Object System.Drawing.Point(960, 20)
     Apply-ButtonTheme -Button $helpButton -Role "btn-help"
     $headerPanel.Controls.Add($helpButton)
     Register-Themed -Control $helpButton -Role "btn-help"
@@ -684,7 +722,7 @@ try {
     $quickFindBox.Text = " Quick Find "
     $quickFindBox.Font = $fontHeader
     $quickFindBox.Location = New-Object System.Drawing.Point(15, 100)
-    $quickFindBox.Size = New-Object System.Drawing.Size(1020, 80)
+    $quickFindBox.Size = New-Object System.Drawing.Size(1020, 110)
     $quickFindBox.Anchor = 'Top,Left,Right'
     $quickFindBox.BackColor = $script:t.Bg
     $quickFindBox.ForeColor = $script:t.Text
@@ -732,6 +770,48 @@ try {
     $quickFindBox.Controls.Add($quickFindHint)
     Register-Themed -Control $quickFindHint -Role "muted"
 
+    # Client scope label + dropdown. "All Clients" = search everywhere (original
+    # behaviour). Selecting a specific client restricts the search to that OU's
+    # servers only - much faster when you already know which client the user is on.
+    $scopeLabel = New-Object System.Windows.Forms.Label
+    $scopeLabel.Text = "Client:"
+    $scopeLabel.Location = New-Object System.Drawing.Point(15, 68)
+    $scopeLabel.AutoSize = $true
+    $scopeLabel.BackColor = $script:t.Bg
+    $scopeLabel.ForeColor = $script:t.Text
+    $quickFindBox.Controls.Add($scopeLabel)
+    Register-Themed -Control $scopeLabel -Role "label-body"
+
+    $scopeDropdown = New-Object System.Windows.Forms.ComboBox
+    $scopeDropdown.Location = New-Object System.Drawing.Point(90, 65)
+    $scopeDropdown.Size = New-Object System.Drawing.Size(350, 26)
+    $scopeDropdown.DropDownStyle = 'DropDownList'
+    $scopeDropdown.BackColor = $script:t.Surface
+    $scopeDropdown.ForeColor = $script:t.Text
+    $quickFindBox.Controls.Add($scopeDropdown)
+    Register-Themed -Control $scopeDropdown -Role "input"
+
+    $clearScopeButton = New-Object System.Windows.Forms.Button
+    $clearScopeButton.Text = "All"
+    $clearScopeButton.Size = New-Object System.Drawing.Size(40, 26)
+    $clearScopeButton.Location = New-Object System.Drawing.Point(448, 65)
+    Apply-ButtonTheme -Button $clearScopeButton -Role "btn-neutral"
+    $quickFindBox.Controls.Add($clearScopeButton)
+    Register-Themed -Control $clearScopeButton -Role "btn-neutral"
+    $clearScopeButton.Add_Click({ $scopeDropdown.SelectedIndex = 0 })
+
+    # When scope changes, update the hint text and button label so the user
+    # knows at a glance what clicking Find will actually search.
+    $scopeDropdown.Add_SelectedIndexChanged({
+        if ($scopeDropdown.SelectedIndex -eq 0) {
+            $quickFindHint.Text = "Searches every RDS server across every client OU. Partial names OK."
+            $findEverywhereButton.Text = "Find Everywhere"
+        } else {
+            $quickFindHint.Text = "Searches only $($scopeDropdown.SelectedItem) servers. Partial names OK."
+            $findEverywhereButton.Text = "Find in Client"
+        }
+    })
+
     # Pressing Enter in the username box is the same as clicking Find.
     # Cleaner workflow - never have to touch the mouse for the common case.
     $usernameTextBox.Add_KeyDown({
@@ -750,7 +830,7 @@ try {
     $browseBox = New-Object System.Windows.Forms.GroupBox
     $browseBox.Text = " Browse by Client "
     $browseBox.Font = $fontHeader
-    $browseBox.Location = New-Object System.Drawing.Point(15, 190)
+    $browseBox.Location = New-Object System.Drawing.Point(15, 220)
     $browseBox.Size = New-Object System.Drawing.Size(1020, 165)
     $browseBox.Anchor = 'Top,Left,Right'
     $browseBox.BackColor = $script:t.Bg
@@ -776,6 +856,18 @@ try {
     $clientDropdown.ForeColor = $script:t.Text
     $browseBox.Controls.Add($clientDropdown)
     Register-Themed -Control $clientDropdown -Role "input"
+
+    $clearClientButton = New-Object System.Windows.Forms.Button
+    $clearClientButton.Text = "All"
+    $clearClientButton.Size = New-Object System.Drawing.Size(40, 26)
+    $clearClientButton.Location = New-Object System.Drawing.Point(448, 30)
+    Apply-ButtonTheme -Button $clearClientButton -Role "btn-neutral"
+    $browseBox.Controls.Add($clearClientButton)
+    Register-Themed -Control $clearClientButton -Role "btn-neutral"
+    $clearClientButton.Add_Click({
+        $clientDropdown.SelectedIndex = -1
+        $serverListBox.Items.Clear()
+    })
 
     # Server list (multi-check). Allow vertical resize through anchoring so
     # the box gets bigger as the user resizes the window.
@@ -843,7 +935,7 @@ try {
     $sessionsBox = New-Object System.Windows.Forms.GroupBox
     $sessionsBox.Text = " Sessions "
     $sessionsBox.Font = $fontHeader
-    $sessionsBox.Location = New-Object System.Drawing.Point(15, 365)
+    $sessionsBox.Location = New-Object System.Drawing.Point(15, 395)
     $sessionsBox.Size = New-Object System.Drawing.Size(1020, 230)
     $sessionsBox.Anchor = 'Top,Bottom,Left,Right'
     $sessionsBox.BackColor = $script:t.Bg
@@ -943,7 +1035,7 @@ try {
     # SECTION 6g - Action buttons row
     # ------------------------------------------------------------------
     $actionPanel = New-Object System.Windows.Forms.Panel
-    $actionPanel.Location = New-Object System.Drawing.Point(15, 605)
+    $actionPanel.Location = New-Object System.Drawing.Point(15, 635)
     $actionPanel.Size = New-Object System.Drawing.Size(1020, 40)
     $actionPanel.Anchor = 'Bottom,Left,Right'
     $actionPanel.BackColor = $script:t.Bg
@@ -989,7 +1081,7 @@ try {
     # the whole session. Mono-spaced so anything column-aligned reads well.
     $logLabel = New-Object System.Windows.Forms.Label
     $logLabel.Text = "Activity:"
-    $logLabel.Location = New-Object System.Drawing.Point(15, 655)
+    $logLabel.Location = New-Object System.Drawing.Point(15, 685)
     $logLabel.AutoSize = $true
     $logLabel.Anchor = 'Bottom,Left'
     $logLabel.BackColor = $script:t.Bg
@@ -998,7 +1090,7 @@ try {
     Register-Themed -Control $logLabel -Role "muted"
 
     $logBox = New-Object System.Windows.Forms.TextBox
-    $logBox.Location = New-Object System.Drawing.Point(15, 675)
+    $logBox.Location = New-Object System.Drawing.Point(15, 705)
     $logBox.Size = New-Object System.Drawing.Size(1020, 80)
     $logBox.Anchor = 'Bottom,Left,Right'
     $logBox.Multiline = $true
@@ -1083,17 +1175,42 @@ try {
         }
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         try {
-            Write-RhinoLog "Enumerating RDS servers across all clients..."
-            $servers = Get-AllRhinoServers
+            # Resolve the search term against AD first so that display names,
+            # surnames, given names, and UPNs all work -- not just SAM accounts.
+            # Resolve-RhinoUsernames logs a warning and returns @() if AD is down,
+            # in which case we fall back to raw wildcard match on quser output.
+            $resolvedSams = @(Resolve-RhinoUsernames -term $query)
+            if ($resolvedSams.Count -gt 0) {
+                Write-RhinoLog "AD resolved '$query' to: $($resolvedSams -join ', ')"
+            } else {
+                Write-RhinoLog "No AD match for '$query', falling back to raw username wildcard." "warn"
+            }
+
+            $scopedClient = if ($scopeDropdown.SelectedIndex -gt 0) { $scopeDropdown.SelectedItem.ToString() } else { $null }
+            if ($scopedClient) {
+                Write-RhinoLog "Enumerating RDS servers for client '$scopedClient'..."
+                $ouPath = "OU=$scopedClient,$script:adRoot"
+                $servers = @(Get-RhinoServers $ouPath)
+            } else {
+                Write-RhinoLog "Enumerating RDS servers across all clients..."
+                $servers = @(Get-AllRhinoServers)
+            }
             if (-not $servers -or $servers.Count -eq 0) {
-                Write-RhinoLog "No RDS servers found in AD. Check connectivity?" "error"
+                Write-RhinoLog "No RDS servers found. Check connectivity or client selection." "error"
                 return
             }
-            Write-RhinoLog "Querying $($servers.Count) servers in parallel for '$query'..."
+            $scope = if ($scopedClient) { "client '$scopedClient'" } else { "all clients" }
+            Write-RhinoLog "Querying $($servers.Count) server(s) in parallel across $scope..."
             $allSessions = Get-RhinoSessions -Servers $servers
-            $matches = $allSessions | Where-Object {
-                $_.Username -like "*$query*"
+
+            # Exact SAM match against resolved names if AD gave us results;
+            # otherwise fall back to wildcard on raw session username.
+            $matches = if ($resolvedSams.Count -gt 0) {
+                $allSessions | Where-Object { $resolvedSams -contains $_.Username }
+            } else {
+                $allSessions | Where-Object { $_.Username -like "*$query*" }
             }
+
             $script:currentSessions = @($matches)
             Apply-SessionFilter
             if ($matches.Count -eq 0) {
@@ -1101,12 +1218,12 @@ try {
             } elseif ($matches.Count -eq 1) {
                 $m = $matches[0]
                 Write-RhinoLog "Found '$($m.Username)' on $($m.Server) (session $($m.SessionID), $($m.State))." "ok"
-                # Auto-select the only result so Sign Out / Shadow work
-                # with zero further clicks.
                 if ($sessionsGrid.Rows.Count -gt 0) { $sessionsGrid.Rows[0].Selected = $true }
             } else {
                 Write-RhinoLog "Found $($matches.Count) sessions matching '$query'." "ok"
             }
+        } catch {
+            Write-RhinoLog "Find failed: $_" "error"
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
@@ -1126,6 +1243,8 @@ try {
             $script:currentSessions = @($allSessions)
             Apply-SessionFilter
             Write-RhinoLog "$($allSessions.Count) sessions returned." "ok"
+        } catch {
+            Write-RhinoLog "Browse query failed: $_" "error"
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
@@ -1153,6 +1272,10 @@ try {
     function Invoke-Shadow {
         $s = Get-SelectedSession
         if (-not $s) { return }
+        if ($s.State -notlike "Active*") {
+            Write-RhinoLog "Cannot shadow '$($s.Username)' - session is $($s.State). Only Active sessions can be shadowed." "warn"
+            return
+        }
         $msg = "Shadow $($s.Username) on $($s.Server) (session $($s.SessionID))?"
         $ans = [System.Windows.Forms.MessageBox]::Show($msg, "RhinoShadow", 'YesNo', 'Question')
         if ($ans -ne 'Yes') { return }
@@ -1161,45 +1284,129 @@ try {
     }
 
     # Sign out (logoff) a session. This is the most common destructive
-    # action so the confirmation dialog spells out exactly who/where.
+    # action so the confirmation dialog spells out exactly who/where, and
+    # we log the exact command being executed BEFORE running it so any
+    # silent failure leaves a breadcrumb in the activity log.
+    #
+    # Previous version used Start-Process -NoNewWindow which sometimes
+    # masked failures (logoff.exe would return 0 even when nothing was
+    # actually done, or the call would never reach logoff.exe at all).
+    # We now use direct invocation via the call operator (&) and check
+    # $LASTEXITCODE, capturing stderr via 2>&1 so any error text from
+    # logoff.exe ends up in the log.
     function Invoke-SignOut {
         $s = Get-SelectedSession
         if (-not $s) { return }
-        $msg = "Sign out $($s.Username) on $($s.Server)?`n`nThis is immediate. Any unsaved work is lost."
+
+        # Defensive: validate the session ID before passing it to logoff.
+        # If the quser parser produced garbage (e.g. shifted columns
+        # captured a state keyword into the ID slot), this catches it and
+        # blames the parser instead of leaving the user to wonder why
+        # logoff "silently failed".
+        $sessionId = "$($s.SessionID)".Trim()
+        $server    = "$($s.Server)".Trim()
+        $username  = "$($s.Username)".Trim()
+        if ($sessionId -notmatch '^\d+$') {
+            Write-RhinoLog "Cannot sign out: session ID '$sessionId' is not numeric. Parser problem?" "error"
+            return
+        }
+        if (-not $server) {
+            Write-RhinoLog "Cannot sign out: server is blank." "error"
+            return
+        }
+
+        $msg = "Sign out $username on $server?`n`nSession ID: $sessionId`nState: $($s.State)`n`nThis is immediate. Any unsaved work is lost."
         $ans = [System.Windows.Forms.MessageBox]::Show($msg, "RhinoShadow - Sign Out", 'YesNo', 'Warning')
-        if ($ans -ne 'Yes') { return }
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        # Log BEFORE we run it. If logoff hangs, crashes, or returns
+        # nonsense, this line is your evidence that the click made it
+        # this far and shows the exact args used.
+        Write-RhinoLog "Running: logoff.exe $sessionId /server:$server"
+
         try {
-            # logoff is a built-in. Args are positional: <session> /server:<host>
-            logoff $s.SessionID /server:$s.Server
-            Write-RhinoLog "Sign-out issued: $($s.Username) on $($s.Server) (session $($s.SessionID))." "ok"
-            # Remove the row from local state so the grid reflects reality
-            # without needing a full re-query.
+            # Direct invocation via the call operator. $LASTEXITCODE picks
+            # up logoff.exe's exit code. 2>&1 redirects stderr into the
+            # success stream so we can capture any error message and log it.
+            # The full path is used so we never accidentally hit a stale
+            # PATH alias or a local logoff.ps1 in the working directory.
+            $logoffPath = Join-Path $env:WINDIR "System32\logoff.exe"
+            if (-not (Test-Path $logoffPath)) {
+                # Fallback to PATH-resolved if for some reason System32 is
+                # not where logoff lives on this host.
+                $logoffPath = "logoff.exe"
+            }
+            $output = & $logoffPath $sessionId "/server:$server" 2>&1
+            $code = $LASTEXITCODE
+            $outText = ($output | Out-String).Trim()
+
+            if ($code -ne 0) {
+                # Failure path. The error from logoff usually goes to
+                # stderr which we captured into $output. Show it so the
+                # user can see exactly why (e.g. "No User exists for *",
+                # "Access is denied", "The RPC server is unavailable").
+                $detail = if ($outText) { $outText } else { "(no output)" }
+                Write-RhinoLog "logoff.exe failed (exit $code): $detail" "error"
+                return
+            }
+            if ($outText) {
+                # Success but logoff said something - keep the trail.
+                Write-RhinoLog "logoff.exe output: $outText"
+            }
+            Write-RhinoLog "Sign-out issued: $username on $server (session $sessionId)." "ok"
+
+            # Drop the row from local state. Faster than a re-query and
+            # gives instant visual feedback that the action took effect.
             $script:currentSessions = @($script:currentSessions | Where-Object {
-                -not ($_.Server -eq $s.Server -and $_.SessionID -eq $s.SessionID)
+                -not ($_.Server -eq $server -and "$($_.SessionID)" -eq $sessionId)
             })
             Apply-SessionFilter
         } catch {
-            Write-RhinoLog "Sign-out failed: $_" "error"
+            Write-RhinoLog "Sign-out threw an exception: $_" "error"
         }
     }
 
     # Send a pop-up message to the selected session via msg.exe. Prompts
-    # for the message body with a small input dialog.
+    # for the message body with a small input dialog. Uses the same direct-
+    # invocation + exit-code-check pattern as Invoke-SignOut for the same
+    # reasons (better diagnostics, easier stderr capture).
     function Invoke-SendMessage {
         $s = Get-SelectedSession
         if (-not $s) { return }
+
+        $sessionId = "$($s.SessionID)".Trim()
+        $server    = "$($s.Server)".Trim()
+        $username  = "$($s.Username)".Trim()
+        if ($sessionId -notmatch '^\d+$') {
+            Write-RhinoLog "Cannot send message: session ID '$sessionId' is not numeric." "error"
+            return
+        }
+
         # InputBox lives in Microsoft.VisualBasic. Load on demand because
         # WinForms doesn't ship a native InputBox.
         Add-Type -AssemblyName Microsoft.VisualBasic
         $body = [Microsoft.VisualBasic.Interaction]::InputBox(
-            "Message to send to $($s.Username) on $($s.Server):",
+            "Message to send to $username on $($server):",
             "RhinoShadow - Send Message", "")
         if (-not $body) { return }
+
+        Write-RhinoLog "Running: msg.exe $sessionId /server:$server `"$body`""
         try {
-            msg $s.SessionID /server:$s.Server $body
-            Write-RhinoLog "Message sent to $($s.Username) on $($s.Server)." "ok"
+            $msgPath = Join-Path $env:WINDIR "System32\msg.exe"
+            if (-not (Test-Path $msgPath)) { $msgPath = "msg.exe" }
+            # Passing $body as a single arg - PowerShell handles the quoting
+            # automatically when args are separate parameters to the call op.
+            $output = & $msgPath $sessionId "/server:$server" $body 2>&1
+            $code = $LASTEXITCODE
+            $outText = ($output | Out-String).Trim()
+            if ($code -ne 0) {
+                $detail = if ($outText) { $outText } else { "(no output)" }
+                Write-RhinoLog "msg.exe failed (exit $code): $detail" "error"
+                return
+            }
+            Write-RhinoLog "Message sent to $username on $server." "ok"
         } catch {
-            Write-RhinoLog "Message send failed: $_" "error"
+            Write-RhinoLog "Message send threw an exception: $_" "error"
         }
     }
 
@@ -1234,7 +1441,10 @@ try {
     })
 
     # When the user picks a client OU, populate the server list.
+    # Guard against SelectedIndex = -1 (set by the "All" clear button) which
+    # leaves SelectedItem as $null - calling .ToString() on null throws.
     $clientDropdown.Add_SelectedIndexChanged({
+        if ($clientDropdown.SelectedIndex -lt 0) { return }
         $selectedOU = $clientDropdown.SelectedItem.ToString()
         $ouPath = "OU=$selectedOU,$script:adRoot"
         $servers = Get-RhinoServers $ouPath
@@ -1251,7 +1461,7 @@ try {
     function Show-RhinoHelp {
         $h = New-Object System.Windows.Forms.Form
         $h.Text = "RhinoShadow - Help"
-        $h.Size = New-Object System.Drawing.Size(620, 520)
+        $h.Size = New-Object System.Drawing.Size(700, 520)
         $h.StartPosition = "CenterParent"
         $h.FormBorderStyle = 'FixedDialog'
         $h.MaximizeBox = $false
@@ -1259,10 +1469,11 @@ try {
         $h.BackColor = $script:t.Bg
         $h.ForeColor = $script:t.Text
         $h.Font = $fontRegular
-        $body = New-Object System.Windows.Forms.TextBox
+        $body = New-Object System.Windows.Forms.RichTextBox
         $body.Multiline = $true
         $body.ReadOnly = $true
         $body.ScrollBars = 'Vertical'
+        $body.WordWrap = $false
         $body.Dock = 'Fill'
         $body.BorderStyle = 'None'
         $body.BackColor = $script:t.Surface
@@ -1324,9 +1535,12 @@ move domains, that one line is what needs updating.
     # the user can see what went wrong rather than getting a silent crash.
     try {
         $ouOptions = Get-RhinoOUs $script:adRoot
+        $scopeDropdown.Items.Add("All Clients") | Out-Null
         foreach ($ou in ($ouOptions | Sort-Object)) {
             $clientDropdown.Items.Add($ou) | Out-Null
+            $scopeDropdown.Items.Add($ou) | Out-Null
         }
+        $scopeDropdown.SelectedIndex = 0
         Write-RhinoLog "Loaded $($ouOptions.Count) client OUs."
         Write-RhinoLog "Ready. Type a username in Quick Find to begin." "ok"
     } catch {
