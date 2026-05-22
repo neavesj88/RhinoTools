@@ -30,6 +30,9 @@
       - Rhino mascot easter egg with escalating moods.
       - Crash log to %TEMP%\RhinoShadow_crash.log so failures aren't silent
         when launched with -WindowStyle Hidden.
+      - Persistent activity log at %LOCALAPPDATA%\RhinoShadow\RhinoShadow.log
+        - every action you take is appended with a full timestamp. Useful
+        for audit / "did I sign that user out earlier?" questions.
 
 .AUTHOR
     Jared Neaves - forked from "Shadow User" (original by the team).
@@ -292,6 +295,23 @@ $mascotPath = Join-Path $scriptPath "Rhino.png"
 # Crash log path. Critical for debugging when the script is launched with
 # -WindowStyle Hidden (no console = silent failures otherwise).
 $crashLog = Join-Path $env:TEMP "RhinoShadow_crash.log"
+
+# Persistent activity log. Every line that goes to the on-screen activity
+# textbox is also appended here for an audit trail across sessions. Per-user
+# location (%LOCALAPPDATA%) so each tech gets their own file - sign-outs and
+# shadow operations are the kind of thing you want a record of.
+# Set $script:logToDisk = $false at the top of this file to turn it off.
+$script:logToDisk = $true
+$logFolder = Join-Path $env:LOCALAPPDATA "RhinoShadow"
+$script:activityLog = Join-Path $logFolder "RhinoShadow.log"
+if ($script:logToDisk) {
+    # Ensure the directory exists. New-Item -Force is fine here because the
+    # target is a directory, not a file (which would truncate on Force).
+    if (-not (Test-Path $logFolder)) {
+        try { New-Item -ItemType Directory -Path $logFolder -Force | Out-Null }
+        catch { $script:logToDisk = $false }   # bail quietly if we can't write
+    }
+}
 
 
 # ==============================================================================
@@ -1267,9 +1287,11 @@ try {
     #              because they all log to it)
     # ------------------------------------------------------------------
 
-    # Write a timestamped line to the activity log. The optional $level
-    # is informational - it changes nothing in the rendering today, but
-    # leaves a hook to colour-code later if desired.
+    # Write a timestamped line to the on-screen activity log AND (if
+    # $script:logToDisk is on) append the same line to the persistent
+    # log file at $script:activityLog with a full ISO-style timestamp.
+    # Disk writes are wrapped in try/catch so a transient I/O error
+    # (file locked, disk full) never breaks the UI flow.
     function Write-RhinoLog {
         param([string]$message, [string]$level = "info")
         $stamp = (Get-Date).ToString("HH:mm:ss")
@@ -1280,6 +1302,17 @@ try {
             default { "     " }
         }
         $logBox.AppendText("$stamp $prefix $message`r`n")
+        if ($script:logToDisk) {
+            try {
+                $diskStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                Add-Content -Path $script:activityLog -Value "$diskStamp $prefix $message" -Encoding UTF8
+            } catch {
+                # One-shot disable to avoid spamming the log on a broken
+                # disk - flip the flag so we don't keep retrying.
+                $script:logToDisk = $false
+                $logBox.AppendText("$stamp [!]   Disk logging disabled: $_`r`n")
+            }
+        }
     }
 
     # Repopulate the grid from $script:currentSessions, optionally filtered
@@ -1676,6 +1709,14 @@ ACTIONS
                reboot in 10 mins".
   Refresh      Re-runs whichever search you last did.
 
+LOG FILE
+--------
+Every line in the on-screen Activity panel is also appended to
+  %LOCALAPPDATA%\RhinoShadow\RhinoShadow.log
+Per-user, never deleted, plain text. Handy for "did I sign that user out
+on Tuesday or am I imagining it?" audits. Disable by setting
+`$script:logToDisk = $false` near the top of the script.
+
 CONFIG
 ------
 The AD root is hardcoded in the script (see `$script:adRoot`). If we ever
@@ -1692,6 +1733,23 @@ move domains, that one line is what needs updating.
     # Populate the client dropdown once at startup. Failure here usually
     # means no domain connectivity - log it but still show the form so
     # the user can see what went wrong rather than getting a silent crash.
+    # Write a session-start banner directly to the disk log (bypassing
+    # Write-RhinoLog so it doesn't clutter the on-screen activity box).
+    # Marks where one run of RhinoShadow ends and the next begins when
+    # you scroll back through the file later.
+    if ($script:logToDisk) {
+        try {
+            $banner = "=" * 70
+            $diskStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            Add-Content -Path $script:activityLog -Value "" -Encoding UTF8
+            Add-Content -Path $script:activityLog -Value $banner -Encoding UTF8
+            Add-Content -Path $script:activityLog -Value "$diskStamp === RhinoShadow session start (user: $env:USERNAME, host: $env:COMPUTERNAME) ===" -Encoding UTF8
+            Add-Content -Path $script:activityLog -Value $banner -Encoding UTF8
+        } catch {
+            $script:logToDisk = $false
+        }
+    }
+
     try {
         $ouOptions = Get-RhinoOUs $script:adRoot
         $scopeDropdown.Items.Add("All Clients") | Out-Null
@@ -1701,6 +1759,9 @@ move domains, that one line is what needs updating.
         }
         $scopeDropdown.SelectedIndex = 0
         Write-RhinoLog "Loaded $($ouOptions.Count) client OUs."
+        if ($script:logToDisk) {
+            Write-RhinoLog "Activity is being recorded to $script:activityLog"
+        }
         Write-RhinoLog "Ready. Type a username in Quick Find to begin." "ok"
     } catch {
         Write-RhinoLog "Failed to enumerate client OUs: $_" "error"
