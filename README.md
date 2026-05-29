@@ -97,23 +97,22 @@ An Active Directory-aware RDS session manager. Lets you browse RDS servers by cl
 
 ## RhinoShadow
 
-**`RhinoShadow/RhinoShadow.ps1`**
+**`RhinoShadow/RhinoShadow.ps1`** — currently at **v1.69**
 
-A polished fork of Shadow User, rebuilt for the common workflow: *"User X just called me — which RDS server are they on, and can I sign them out?"* Same core functionality as the original, plus a stack of UX and performance improvements.
+A polished fork of Shadow User, rebuilt for the common workflow: *"User X just called me — which RDS server are they on, which PC are they on, sign them out or shadow them."* Three clicks or fewer.
 
-**What's new vs Shadow User:**
-- **Quick Find** — type a username, press Enter, and it searches every RDS server across every client OU **in parallel** (runspace pool, ~2s vs ~15s+ sequentially). The headline feature.
-- **Robust session parsing** — fixed a bug where the original silently dropped disconnected sessions (the ones you most often want to log off).
-- **Sessions grid** — Username, State, Idle, Logon Time, Server, Session ID, Session Name. Click headers to sort. Live filter box for substring matching across Username/Server/State.
-- **State colouring** — Active sessions in green, Disconnected in amber, errors in red.
-- **Action buttons** — Shadow, Sign Out, Send Message, Refresh, all themed and labelled clearly.
-- **Status log** — timestamped activity feed at the bottom so you can see what was queried and what came back.
-- **Dark / light theme toggle** — matches the RhinoCopy design language.
-- **Double-click to shadow** — matches RDP-console muscle memory.
-- **Rhino mascot** — click for escalating moods.
-- **In-app help dialog**, **crash log** to `%TEMP%\RhinoShadow_crash.log`.
+**Headline features:**
+- **Quick Find** — type any name (username, first name, surname, display name, or UPN) and RhinoShadow resolves it against AD, then searches every RDS server **in parallel** via runspace pool (~30 servers in 2-3s instead of 30s+).
+- **Local Computer column** — shows the workstation each user is connecting FROM, looked up via the WTS API. Saves a manual lookup for RMM handoffs.
+- **MSP / multi-tenant dual-root config** — separate AD trees for client tenants and RDS hosts, joined by client OU name. Single-tenant setups point both at the same OU.
+- **Background async sign-out** with post-action verification — re-queries the server after `logoff.exe` returns to confirm the session actually went, catches the Server 2019 silent-success failure mode.
+- **stderr capture** for logoff and msg failures — surfaces the actual Windows error message ("Access is denied", etc) instead of a bare exit code.
+- **Light / dark theme toggle**, **live filter** across Username / Server / State / Local Computer, sortable grid, custom themed 255-char message dialog.
+- **Persistent activity log** at `%LOCALAPPDATA%\Temp\RhinoShadow.log` — full audit trail including message bodies and target workstations.
 
-The original Browse-by-Client flow is preserved as a secondary panel — pick an OU, tick servers, hit Show Sessions.
+Full release notes, changelog, configuration guide, and known behaviours are in [`RhinoShadow/README.md`](RhinoShadow/README.md). The code-review request that accompanies this release is in [`RhinoShadow/RhinoShadow_ReviewTicket.txt`](RhinoShadow/RhinoShadow_ReviewTicket.txt).
+
+The original Browse-by-Client flow is preserved as a secondary panel.
 
 *Forked by Jared from the original Shadow User. Requires the same domain access.*
 

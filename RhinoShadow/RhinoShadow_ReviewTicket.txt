@@ -1,0 +1,42 @@
+RhinoShadow v1.69 - Code Review Request
+
+SUMMARY
+- PowerShell WinForms RDS session manager, forked and vastly expanded from the original Shadow User
+- Original Shadow User is frequently used, located C:\Scripts\Shadow User on RSAT2
+- New tool located C:\Scripts\RhinoShadow
+- Intention is to make this available to the entire team on RSAT2 once reviewed
+- I have spent the last week testing and bug fixing in our live environment
+
+USE CASE
+- "User X called for help, find their session, sign them out or shadow them" in three clicks or fewer
+- Quick Find: type a username (partial OK), searches every RDS server across all clients in parallel
+- Browse by Client: pick a client, see all its RDS hosts pre-ticked, show every session on them
+- Scope a Quick Find to a single client to narrow the search
+- Local Computer column shows the workstation the user is connecting FROM, for RMM handoffs
+
+KEY FEATURES
+- Parallel session querying via runspace pool (not sequential) - approx 30 servers in 2-3s instead of 30s+
+- AD name resolution so you can search by display name, surname, first name, SAM, or UPN
+- Sign Out with post-action verification (re-queries to confirm the session actually went)
+- Shadow via mstsc /shadow /control
+- Send Message via msg.exe with a 255-char themed input dialog
+- Live filter across Username, Server, State and Local Computer
+- Light/dark theme toggle
+- Background async sign-out so the UI stays responsive and close-during-action is handled safely
+
+LOGGING
+- Activity log with timestamps, all actions and an audit trail (incl. message bodies and target workstation) at %LOCALAPPDATA%\Temp\RhinoShadow.log
+- Crash log for startup failures at %LOCALAPPDATA%\Temp\RhinoShadow_crash.log
+
+CONFIGURATION
+- Two AD root variables at the top of the script (client tenant tree and RDS server tree), clearly marked in a CONFIGURATION banner block
+- Built for our MSP multi-tenant layout but works single-tenant by pointing both at the same OU
+
+NOTES FOR REVIEWERS
+- Code is heavily commented throughout - every function has a header explaining purpose, design choices and failure modes
+- A README accompanies the script listing all design changes, new functions and bugs fixed over this cycle
+- No client names, server names, usernames or IPs in comments or help text (only the working config variables reference the domain)
+- Particular areas worth a look: the runspace pool dispatch/cleanup, the WTS P/Invoke for Local Computer lookups, the async sign-out timer pattern, and the quser header-driven parser
+
+WHAT I NEED
+- Review for correctness, security and anything that would block deploying to the whole team on RSAT2
