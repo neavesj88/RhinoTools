@@ -8,50 +8,34 @@
 
 .DESCRIPTION
     Polished WinForms GUI wrapping Robocopy. Features:
-      - Source / destination selection with browse dialogs.
-      - Performance modes (/MT 18 / 9 / 4).
-      - Copy flag presets (Data / Attributes / Timestamps / Security / Owner).
-      - Standard recurse (/E) vs destructive Mirror (/MIR) mode.
-      - Optional dry run (/L) and timestamped log file (/LOG+:).
-      - Junction exclusion (/XJ) hardcoded - prevents AppData infinite recursion.
-      - Working animation during copy (marquee bar + cycling status text +
-        spinner glyph + elapsed-time clock).
-      - Plain-English exit code decoder (decomposes the bit-flag value into
-        which conditions actually fired, e.g. "3 = 1+2 = files copied + extras").
-      - In-app Robocopy Flag Reference popup.
-      - Light / dark theme toggle with full repaint of registered controls.
-      - Copy-command-to-clipboard for users learning the tool.
-      - Clickable Rhino mascot easter egg with escalating moods.
-      - Dual-purpose Cancel/Clear button (Cancel during run, Clear when idle).
+    - Source/destination selection with browse dialogs.
+    - Performance modes (MT:18 / MT:9 / MT:4).
+    - Copy flag presets (Data / Attributes / Timestamps / Security / Owner).
+    - Optional dry run and log file output.
+    - Live progress and status log tailing.
+    - Clickable Rhino mascot easter egg that cycles flavour lines through the
+      header subtitle (escalating mood), keeping the status log clean for
+      real robocopy output.
+    - Runtime light/dark theme toggle (defaults to dark).
 
 .AUTHOR
     Jared Neaves with a little help from Grock.
 
 .CODE STRUCTURE
-    1.  Assembly imports + WinForms bootstrap
-    2.  Theme palettes (dark + light) + font definitions
-    3.  Theme helpers (Register-Themed, Apply-ButtonTheme, Apply-Theme)
-    4.  Script-level state + path resolution + crash log path
-    5.  Form build (inside the outer try block):
-        5a. Form shell + FormClosing handler + icon
-        5b. Header panel - mascot, title, subtitle, progress label + bar,
-            flag-reference and theme-toggle buttons stacked top-right
-        5c. Mascot click-count easter egg message arrays + click handler
-        5d. Path input rows (source / destination)
-        5e. Option group boxes (Performance Mode, Copy Options, Mode)
-        5f. Tooltips + Create-Log / Dry-Run checkboxes + status log textbox
-        5g. Action buttons (Copy Files, Copy Command, Cancel/Clear)
-        5h. Execute-Copy, Generate-Command, Format-RobocopyCommand,
-            Show-FlagReference, Set-ButtonCancelMode, Set-ButtonClearMode
-        5i. ShowDialog (modal blocking call)
-    6.  Outer catch block - logs any startup crash to %TEMP%\RhinoCopy_crash.log
-
-.NOTES
-    - The script intentionally launches robocopy SYNCHRONOUSLY (via
-      Start-Process + DoEvents wait loop, NOT BeginOutputReadLine).
-      Do not change this without reading HANDOFF.md - the async pattern
-      caused PowerShell host crashes due to a threadpool / runspace race.
-    - Version 1.69 is intentional, do not change.
+    1. Assembly imports
+    2. Theme palettes + fonts
+    3. Theme helpers (register/apply)
+    4. Script state + path resolution
+    5. Form build (inside try block):
+        5a. Form shell + FormClosing
+        5b. Header panel + mascot (subtitle easter egg) + progress + theme toggle
+        5c. Path inputs
+        5d. Option group boxes
+        5e. Checkboxes + status log
+        5f. Action buttons
+        5g. Functions (Execute-Copy, Generate-Command)
+        5h. ShowDialog
+    6. Startup crash catch
 ================================================================================
 #>
 
@@ -103,18 +87,9 @@ $script:themes = @{
         DangerHov  = [System.Drawing.Color]::FromArgb(185, 40, 55)
     }
 }
-$script:currentTheme = "dark"   # Default theme on launch. Toggle to "light" via the header button.
-$script:t = $script:themes[$script:currentTheme]   # Active-theme shortcut, re-pointed on toggle.
+$script:currentTheme = "dark"   # default theme on launch
+$script:t = $script:themes[$script:currentTheme]   # active-theme shortcut
 
-# Fonts used throughout the UI. Pre-created once at script scope so every
-# control reuses the same Font objects (cheaper than allocating new ones
-# every time, and consistent appearance):
-#   - Regular:  body text, labels, radio/checkbox text
-#   - Semibold: section headers, primary button text
-#   - Title:    the big "RhinoCopy" wordmark in the header
-#   - Header:   group box titles ("Performance Mode", "Copy Options", "Mode")
-#   - Mono:     the status log textbox so robocopy's column-aligned output
-#               lines up cleanly. Consolas is on every Windows install.
 $fontRegular  = New-Object System.Drawing.Font("Segoe UI", 10)
 $fontSemibold = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
 $fontTitle    = New-Object System.Drawing.Font("Segoe UI Semibold", 18)
@@ -123,61 +98,20 @@ $fontMono     = New-Object System.Drawing.Font("Consolas", 9.5)
 
 
 # ==============================================================================
-# SECTION 3 - Theme helpers (Register-Themed, Apply-ButtonTheme, Apply-Theme)
+# SECTION 3 - Theme helpers
 # ==============================================================================
-# Pattern explanation:
-#   1. Every control that needs to participate in theme switching is "registered"
-#      with a semantic role string when it's created. Role examples: "surface",
-#      "input", "muted", "btn-success", "radio", etc.
-#   2. The control's initial colours are also set explicitly at creation time
-#      using $script:t.<Property>, so the form looks correct on first paint
-#      without needing Apply-Theme to be called.
-#   3. When the user clicks the Light/Dark toggle button, $script:currentTheme
-#      is flipped, $script:t is re-pointed to the new palette, and Apply-Theme
-#      is called. Apply-Theme walks every registered control and repaints it
-#      based on its role using the new palette.
-# This is conceptually identical to CSS classes: the role tag is like a class
-# name, and the two theme palettes are like two stylesheets.
-# Why this rather than recreate the form on toggle? Because that would lose
-# all user-entered state (source/dest paths, radio selections, status log).
-# Walking and repainting is much cheaper.
+# Pattern: every themeable control is tagged with a semantic role when it's
+# created. Apply-Theme walks the list and repaints based on current palette.
+# This is the mechanism that makes the dark/light toggle work at runtime.
 
-# The list of (Control, Role) pairs. Populated by Register-Themed as controls
-# are built up.
 $script:themedControls = @()
 
-# Register-Themed
-# ---------------
-# Tag a control with a semantic role so Apply-Theme can paint it later.
-# The += operator on an array assigns a new array back, which does NOT emit
-# to the pipeline. Using $script:themedControls.Add() would emit the count.
 function Register-Themed {
     param($Control, [string]$Role)
+    # Use += which reassigns the array - doesn't emit to pipeline.
     $script:themedControls += @{ Control = $Control; Role = $Role }
 }
 
-# Apply-ButtonTheme
-# -----------------
-# Apply a button role to a single Button control. Called by Apply-Theme (when
-# the theme is toggled) and also directly at button-creation time. Pulls all
-# colours from $script:t at call time, so theme switches work correctly.
-#
-# We use FlatStyle = Flat throughout so we have full control over button
-# appearance. The default "System" FlatStyle inherits OS chrome and ignores
-# our BackColor/ForeColor settings, which defeats theming.
-#
-# Roles:
-#   btn-success  - Solid green, white text, bold. Used for the primary
-#                  "Copy Files" action button.
-#   btn-accent   - Solid blue, white text, regular weight. Used for the
-#                  secondary "Copy Command to Clipboard" button.
-#   btn-danger   - Solid red, white text. Used for the Cancel mode of the
-#                  dual-purpose Cancel/Clear button.
-#   btn-help     - Subtle background, accent text, semibold. Used for the
-#                  small round "?" help buttons next to radio options.
-#   btn-neutral  - Plain surface background, default text. Used for Browse
-#                  buttons, the header theme/flag-reference buttons, and
-#                  the Clear mode of the dual-purpose button.
 function Apply-ButtonTheme {
     param($Button, [string]$Role)
     $t = $script:t
@@ -194,19 +128,8 @@ function Apply-ButtonTheme {
     }
 }
 
-# Apply-Theme
-# -----------
-# Walk every registered control and re-apply its role-based colours from the
-# current $script:t palette. Called when the user clicks the Light/Dark
-# toggle button.
-#
-# Each control assignment is wrapped in try/catch so that ONE malfunctioning
-# control (e.g. one whose handle has been disposed) doesn't abort the whole
-# repaint loop and leave the form in a half-themed state.
-#
-# Non-button roles set BackColor and ForeColor directly. Button roles delegate
-# to Apply-ButtonTheme which handles their more complex multi-property setup
-# (border, hover, mousedown colours, etc.).
+# Walks all registered controls and applies the active palette. Wrapped in
+# try/catch per control so one bad control doesn't kill the whole repaint.
 function Apply-Theme {
     $t = $script:t
     if ($form) { $form.BackColor = $t.Bg; $form.ForeColor = $t.Text }
@@ -234,114 +157,78 @@ function Apply-Theme {
             }
         } catch { }
     }
-    # The header panel has a custom Paint handler that draws its own border
-    # using $script:t.Border at paint time. We have to Invalidate it so the
-    # border redraws in the new theme colour.
     if ($headerPanel) { try { $headerPanel.Invalidate() } catch { } }
 }
 
 
 # ==============================================================================
-# SECTION 4 - Script-level state + path resolution
+# SECTION 4 - Script state + path resolution
 # ==============================================================================
-# $script:process holds the running robocopy Process object. Used by the
-# Cancel button to send Kill() and by the wait loop in Execute-Copy to detect
-# when robocopy has finished. Null when nothing is running.
 $script:process = $null
+$script:isClosing = $false
 
-# Resolve the script's directory in a launch-context-tolerant way. We need
-# this to locate rhino_copy.ico relative to the .ps1 file regardless of how
-# the script was started:
-#   - $PSScriptRoot is the standard automatic variable for "the folder this
-#     script lives in" under powershell.exe -File launches. Most reliable.
-#   - $PSCommandPath is set when the script is dot-sourced or invoked via
-#     a path. Take its parent directory.
-#   - $MyInvocation.MyCommand.Path is a legacy fallback for ISE / older hosts.
-#   - Last resort: current working directory, which works if the user
-#     happened to cd into the script's directory before running it.
+# Path resolution with fallbacks for various launch contexts.
 $scriptPath = if ($PSScriptRoot) { $PSScriptRoot }
               elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
               elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
               else { (Get-Location).Path }
 $iconPath = Join-Path $scriptPath "rhino_copy.ico"
 
-# Crash log path. Critical for diagnosing failures when the script is
-# launched with -WindowStyle Hidden, because then there is no visible
-# console and Write-Host / unhandled errors otherwise vanish silently.
-# The outer catch block in Section 6 appends here on any startup failure.
+# Crash log - essential for diagnosing -WindowStyle Hidden launch failures
+# where no console output is visible.
 $crashLog = Join-Path $env:TEMP "RhinoCopy_crash.log"
 
 
 # ==============================================================================
-# SECTION 5 - Form build (entire form construction is inside an outer try
-#             block so any startup error is caught and logged)
+# SECTION 5 - Form build (inside try block)
 # ==============================================================================
 try {
 
-    # --------------------------------------------------------------------
-    # SECTION 5a - Form shell, top-level form properties, FormClosing
-    # --------------------------------------------------------------------
+    # --- 5a. Form shell + FormClosing ---------------------------------------
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "RhinoCopy v1.69"
-    # MinimumSize prevents the user shrinking the form to where controls
-    # would overlap. Set just slightly smaller than the default Size so
-    # there is no jarring resize on first display.
-    $form.MinimumSize = New-Object System.Drawing.Size(1000,810)
-    $form.Size = New-Object System.Drawing.Size(1100,830)
+    $form.MinimumSize = New-Object System.Drawing.Size(1000,790)
+    $form.Size = New-Object System.Drawing.Size(1100,810)
     $form.StartPosition = "CenterScreen"
     $form.MaximizeBox = $true
     $form.FormBorderStyle = 'Sizable'
     $form.Font = $fontRegular
     $form.AutoScaleMode = 'Font'
     $form.Padding = New-Object System.Windows.Forms.Padding(6)
-    # Set form background and text colour to the active theme NOW (rather
-    # than relying on Apply-Theme to do it later), so dark mode is visible
-    # the instant the form first paints. Without this the form body would
-    # flash default Windows grey for one frame before being repainted.
+    # Set form colours from the active theme so dark mode is visible on load.
+    # Without this the form body would render in default Windows grey while
+    # the panels and controls inside it are dark.
     $form.BackColor = $script:t.Bg
     $form.ForeColor = $script:t.Text
-    # FormClosing handler. Since robocopy runs synchronously (the click
-    # handler blocks while the copy runs), the form is functionally locked
-    # during a copy - the user cannot reach the close button. So this
-    # handler is just a no-op placeholder. Kept here to make it obvious
-    # where to add close-time cleanup if it's ever needed.
+    # FormClosing handler. Since robocopy runs synchronously now, the form
+    # can only be closed when no copy is in progress (the UI is blocked
+    # during a copy), so this is just a safe no-op.
     $form.Add_FormClosing({
         param($sender, $e)
-        # Intentionally empty. The form cannot be closed while a copy is
-        # running because the UI thread is occupied by Execute-Copy's
-        # DoEvents wait loop. After the copy completes, control returns
-        # to the message pump and normal close behaviour resumes.
+        $script:isClosing = $true
     })
 
-    # Window icon - silently ignored if the .ico file is missing.
     if (Test-Path $iconPath) { try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch { } }
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5b - Header panel: mascot, title, progress, top-right buttons
-    # --------------------------------------------------------------------
-    # The header panel acts as a card containing the mascot picture box on
-    # the left, title and subtitle labels in the middle, a progress label
-    # and bar below them, and two buttons stacked top-right (Flag Reference
-    # over Light/Dark mode toggle).
-    #
-    # The panel has a custom Paint handler that draws its own border. We
-    # use Paint rather than setting BorderStyle because BorderStyle gives
-    # us the ugly default System chrome that won't respect $script:t.Border.
-    # The Paint handler reads $script:t at paint time, so when the theme
-    # is toggled and Apply-Theme calls $headerPanel.Invalidate(), the
-    # border is automatically redrawn in the new theme colour.
+    # --- 5b. Header panel ---------------------------------------------------
+    # The header is a surface-coloured card spanning the top of the window. It
+    # holds, left to right: the clickable rhino mascot, the title wordmark with
+    # the subtitle beneath it (the subtitle doubles as the mascot easter-egg
+    # display), a status label + progress bar in the centre-right lane, and the
+    # Flag Reference / theme-toggle buttons stacked in the top-right corner. The
+    # subtitle and the progress lane share the lower row, so the subtitle is
+    # kept narrow (ending before x=350) and any long easter-egg line wraps down
+    # into the empty header space rather than colliding with the progress bar.
+    # The custom Paint border reads $script:t at paint time, so a theme switch
+    # repaints it correctly the moment Apply-Theme calls Invalidate().
     $headerPanel = New-Object System.Windows.Forms.Panel
     $headerPanel.Location = New-Object System.Drawing.Point(10,10)
     $headerPanel.Size = New-Object System.Drawing.Size(1070,84)
-    # Anchor Top|Left|Right so the panel stretches with the form on resize.
     $headerPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $headerPanel.BackColor = $script:t.Surface
     $headerPanel.Add_Paint({
         param($s, $e)
-        # Read $script:t at paint time so the border colour updates on
-        # theme switch. The pen is disposed inside this scope to avoid
-        # leaking a GDI handle every time the panel repaints.
         $pen = New-Object System.Drawing.Pen($script:t.Border, 1)
         $e.Graphics.DrawRectangle($pen, 0, 0, $s.Width - 1, $s.Height - 1)
         $pen.Dispose()
@@ -349,11 +236,6 @@ try {
     Register-Themed -Control $headerPanel -Role "surface"
     $form.Controls.Add($headerPanel)
 
-    # ----- Mascot picture box (clickable easter egg trigger) -----
-    # PictureBox is a small bitmap displayed on the left of the header.
-    # Clicking it cycles through three escalating mood arrays of messages.
-    # The Hand cursor signals it's clickable. SizeMode = StretchImage so
-    # the bitmap fits the 60x60 box regardless of source dimensions.
     $pictureBox = New-Object System.Windows.Forms.PictureBox
     $pictureBox.Location = New-Object System.Drawing.Point(10,5)
     $pictureBox.Size = New-Object System.Drawing.Size(60,60)
@@ -361,21 +243,17 @@ try {
     $pictureBox.Cursor = [System.Windows.Forms.Cursors]::Hand
     $pictureBox.BackColor = $script:t.Surface
     Register-Themed -Control $pictureBox -Role "surface"
-    # Loads the rhino_copy.ico file as the mascot image. The .ico file is
-    # shipped alongside the script. Wrapped in try/catch so an absent or
-    # corrupt icon doesn't kill form construction - the mascot is just
-    # invisible in that case.
     if (Test-Path $iconPath) { try { $pictureBox.Image = [System.Drawing.Image]::FromFile($iconPath) } catch { } }
 
-    # ----- Easter egg message arrays -----
-    # Three arrays representing the rhino's mood as the user keeps clicking:
-    #   1-10 clicks   -> friendlyMessages (helpful IT humour)
-    #   11-20 clicks  -> irritatedMessages (he's getting annoyed)
-    #   21+ clicks    -> blanketStatements (he's retired, send help to neaves.au/resume)
-    # Any real interaction with the form (Browse, Copy, radio change)
-    # resets $script:clickCount to 0 so the mascot stays friendly when the
-    # user is actually working. $script:lastMessage prevents the same
-    # message being shown twice in a row.
+    # --- Mascot click easter egg --------------------------------------------
+    # Clicking the rhino cycles a flavour line through the header subtitle. The
+    # mood escalates with the click count: clicks 1-10 draw from the friendly
+    # pool, 11-20 from the irritated pool, and 21+ from the "retired" blanket
+    # statements. Pure cosmetics - it never touches copy state. Any real
+    # interaction (browse, copy, radio/checkbox change, opening a help popup)
+    # resets $script:clickCount to 0 so the rhino starts friendly again next
+    # time. $script:lastMessage tracks the previous line so we never show the
+    # same one twice in a row.
     $script:clickCount = 0
     $script:lastMessage = ""
     $friendlyMessages = @(
@@ -525,30 +403,27 @@ try {
         "I quit. Hiring managers can find me at https://neaves.au/resume",
         "Forwarding my CV to neaves.au/resume - you can't fire me, I fire me."
     )
-    # Mascot click handler. Bumps the counter, picks a non-repeating message
-    # from the appropriate mood array, writes it into the status log. The
-    # `do...while` loop with the lastMessage check prevents the same message
-    # appearing twice consecutively. The `Count -gt 1` guard avoids an
-    # infinite loop in the (unreachable) case of a single-entry array.
     $pictureBox.Add_Click({
         $script:clickCount++
+        # Pick the pool for the current mood, then draw a message from it,
+        # re-rolling if we drew the same line twice in a row so the text always
+        # visibly changes on each click (skip the re-roll if a pool has only
+        # one entry, otherwise the do/while would loop forever).
         $newMessage = ""
-        if ($script:clickCount -le 10) {
-            do { $newMessage = $friendlyMessages | Get-Random } while ($newMessage -eq $script:lastMessage -and $friendlyMessages.Count -gt 1)
-        } elseif ($script:clickCount -le 20) {
-            do { $newMessage = $irritatedMessages | Get-Random } while ($newMessage -eq $script:lastMessage -and $irritatedMessages.Count -gt 1)
-        } else {
-            do { $newMessage = $blanketStatements | Get-Random } while ($newMessage -eq $script:lastMessage -and $blanketStatements.Count -gt 1)
-        }
+        if ($script:clickCount -le 10) { do { $newMessage = $friendlyMessages | Get-Random } while ($newMessage -eq $script:lastMessage -and $friendlyMessages.Count -gt 1) }
+        elseif ($script:clickCount -le 20) { do { $newMessage = $irritatedMessages | Get-Random } while ($newMessage -eq $script:lastMessage -and $irritatedMessages.Count -gt 1) }
+        else { do { $newMessage = $blanketStatements | Get-Random } while ($newMessage -eq $script:lastMessage -and $blanketStatements.Count -gt 1) }
         $script:lastMessage = $newMessage
-        $txtStatus.Text = "Secret Rhino Message: " + $newMessage
+        # Cycle the message through the HEADER SUBTITLE - the same place
+        # RhinoShadow and RhinoDrain put their mascot lines. It is pure flavour
+        # and belongs in the header, NOT in the status log, which is reserved
+        # for real robocopy output. The full text is also set as the subtitle's
+        # tooltip so a long line that the label clips is still readable on hover.
+        $lblSubtitle.Text = $newMessage
+        $tooltip.SetToolTip($lblSubtitle, $newMessage)
     })
     $headerPanel.Controls.Add($pictureBox)
 
-    # ----- Title and subtitle labels -----
-    # Title is the big "RhinoCopy" wordmark to the right of the mascot.
-    # Subtitle is the tagline below it. Both registered for theming so they
-    # repaint on dark/light toggle.
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = "RhinoCopy"
     $lblTitle.Location = New-Object System.Drawing.Point(80,10)
@@ -560,24 +435,34 @@ try {
     Register-Themed -Control $lblTitle -Role "header"
     $headerPanel.Controls.Add($lblTitle)
 
+    # Subtitle / tagline, and the mascot easter-egg display (the click handler
+    # above rewrites its Text). It is given a FULL-WIDTH, two-line lane that
+    # sits just below the progress bar - the progress bar is only animating
+    # during a copy, and the rhino is only clicked when idle, so the message
+    # can happily use the space under the bar. At ~850px over two lines even
+    # the longest flavour line fits without being clipped. AutoEllipsis stays
+    # on purely as a backstop, and UseMnemonic is off so a literal "&" in a
+    # line is not swallowed as a keyboard accelerator.
     $lblSubtitle = New-Object System.Windows.Forms.Label
     $lblSubtitle.Text = "Robocopy with a friendly face"
-    $lblSubtitle.Location = New-Object System.Drawing.Point(82,40)
-    $lblSubtitle.Size = New-Object System.Drawing.Size(260,18)
+    $lblSubtitle.Location = New-Object System.Drawing.Point(82,50)
+    $lblSubtitle.Size = New-Object System.Drawing.Size(850,30)
+    $lblSubtitle.AutoEllipsis = $true
+    $lblSubtitle.UseMnemonic = $false
+    $lblSubtitle.Font = $fontRegular
+    $lblSubtitle.BackColor = $script:t.Surface
+    $lblSubtitle.ForeColor = $script:t.Muted
+    Register-Themed -Control $lblSubtitle -Role "muted"
+    $headerPanel.Controls.Add($lblSubtitle)
+    $lblSubtitle.AutoEllipsis = $true
+    $lblSubtitle.UseMnemonic = $false
     $lblSubtitle.Font = $fontRegular
     $lblSubtitle.BackColor = $script:t.Surface
     $lblSubtitle.ForeColor = $script:t.Muted
     Register-Themed -Control $lblSubtitle -Role "muted"
     $headerPanel.Controls.Add($lblSubtitle)
 
-    # ----- Progress label and bar -----
-    # The progress label sits above the progress bar. Its text and colour
-    # are both updated dynamically during a copy:
-    #   - At rest:        "Ready"               (muted colour)
-    #   - During copy:    animated by a Timer   (accent colour)
-    #   - After success:  "Completed (exit N)"  (success colour)
-    #   - After failure:  "Failed (exit N)"     (danger colour)
-    # Anchor Top|Left|Right so it stretches with the form on resize.
+    # Status label - changes colour per state (muted/accent/success/danger).
     $lblProgress = New-Object System.Windows.Forms.Label
     $lblProgress.Text = "Ready"
     $lblProgress.Location = New-Object System.Drawing.Point(350,10)
@@ -590,11 +475,11 @@ try {
     Register-Themed -Control $lblProgress -Role "muted"
     $headerPanel.Controls.Add($lblProgress)
 
-    # The progress bar starts in Continuous style at 0%. Execute-Copy
-    # flips it to Marquee style during a copy so it shows a scrolling
-    # chevron animation (since robocopy doesn't emit reliable overall %).
+    # Progress bar sits in the upper-right under the status label. Pulled up
+    # to end at y=46 so the full-width subtitle/easter-egg lane has clear space
+    # directly beneath it.
     $progressBar = New-Object System.Windows.Forms.ProgressBar
-    $progressBar.Location = New-Object System.Drawing.Point(350,34)
+    $progressBar.Location = New-Object System.Drawing.Point(350,30)
     $progressBar.Size = New-Object System.Drawing.Size(580,16)
     $progressBar.Style = "Continuous"
     $progressBar.ForeColor = $script:t.Accent
@@ -602,15 +487,8 @@ try {
     Register-Themed -Control $progressBar -Role "progressbar"
     $headerPanel.Controls.Add($progressBar)
 
-    # ----- Header buttons (Flag Reference + Theme Toggle, stacked) -----
-    # Two buttons in the top-right column, stacked vertically. Anchored to
-    # Top|Right so they stay pinned to the top-right corner on resize.
-    # Both use the neutral button style since they're auxiliary actions
-    # (not primary or destructive).
-
-    # Flag Reference button - opens a child dialog with every robocopy flag
-    # documented. Click resets the mascot counter so opening the reference
-    # mid-easter-egg doesn't keep his anger going.
+    # --- Header buttons (flag reference + theme toggle, stacked vertically) ---
+    # Flag reference: opens a popup with every robocopy flag explained.
     $btnFlags = New-Object System.Windows.Forms.Button
     $btnFlags.Location = New-Object System.Drawing.Point(945,10)
     $btnFlags.Size = New-Object System.Drawing.Size(115,30)
@@ -621,12 +499,8 @@ try {
     $btnFlags.Add_Click({ Show-FlagReference; $script:clickCount = 0 })
     $headerPanel.Controls.Add($btnFlags)
 
-    # Theme toggle button. The text shows the TARGET theme (what happens
-    # when you click), not the current theme. So in dark mode it reads
-    # "Light mode" because clicking it switches to light.
-    # On click: flip $script:currentTheme, re-point $script:t to the new
-    # palette, then call Apply-Theme to walk all registered controls and
-    # repaint them with the new colours.
+    # Theme toggle: flips dark/light and repaints all registered controls.
+    # Label shows the *target* theme (what happens if you click).
     $btnTheme = New-Object System.Windows.Forms.Button
     $btnTheme.Location = New-Object System.Drawing.Point(945,44)
     $btnTheme.Size = New-Object System.Drawing.Size(115,30)
@@ -643,19 +517,17 @@ try {
     $headerPanel.Controls.Add($btnTheme)
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5c - Path input rows (Source and Destination)
-    # --------------------------------------------------------------------
-    # Two identical-looking rows: a label on the left, a wide textbox in
-    # the middle (anchored to stretch with the form), and a Browse button
-    # on the right (anchored to stay pinned right on resize). The label
-    # role is "label-body" because labels outside group boxes sit on the
-    # form's main background, not on a surface card.
-
-    # --- Source row ---
+    # --- 5c. Path input rows ------------------------------------------------
+    # Source and destination each get a label, a wide textbox, and a Browse
+    # button. The textboxes are anchored Left+Right so they stretch when the
+    # window is resized; the Browse buttons are anchored Right so they stay
+    # pinned to the textbox's right edge. Both Browse handlers pre-seed the
+    # folder dialog with the current path when it is valid, which saves
+    # navigating from the drive root every time, and both reset the mascot
+    # click counter so fiddling with paths calms the rhino back down.
     $lblSource = New-Object System.Windows.Forms.Label
     $lblSource.Text = "Source"
-    $lblSource.Location = New-Object System.Drawing.Point(10,120)
+    $lblSource.Location = New-Object System.Drawing.Point(10,106)
     $lblSource.Size = New-Object System.Drawing.Size(110,22)
     $lblSource.Font = $fontHeader
     $lblSource.BackColor = $script:t.Bg
@@ -664,24 +536,18 @@ try {
     $form.Controls.Add($lblSource)
 
     $txtSource = New-Object System.Windows.Forms.TextBox
-    $txtSource.Location = New-Object System.Drawing.Point(125,118)
+    $txtSource.Location = New-Object System.Drawing.Point(125,104)
     $txtSource.Size = New-Object System.Drawing.Size(845,26)
     $txtSource.Font = $fontRegular
     $txtSource.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $txtSource.BackColor = $script:t.Surface
     $txtSource.ForeColor = $script:t.Text
-    # Top|Left|Right anchor stretches the textbox with the form width,
-    # keeping the Browse button pinned to the right edge.
     $txtSource.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     Register-Themed -Control $txtSource -Role "input"
     $form.Controls.Add($txtSource)
 
-    # Source Browse button. Opens FolderBrowserDialog. If the textbox
-    # already contains a valid path, pre-seed the dialog with it so the
-    # user doesn't have to navigate from C:\ each time. Resets the mascot
-    # click counter since this is a real interaction.
     $btnSource = New-Object System.Windows.Forms.Button
-    $btnSource.Location = New-Object System.Drawing.Point(980,116)
+    $btnSource.Location = New-Object System.Drawing.Point(980,102)
     $btnSource.Size = New-Object System.Drawing.Size(90,30)
     $btnSource.Text = "Browse"
     $btnSource.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
@@ -697,11 +563,9 @@ try {
     })
     $form.Controls.Add($btnSource)
 
-    # --- Destination row ---
-    # Same pattern as Source, just 38px lower.
     $lblDest = New-Object System.Windows.Forms.Label
     $lblDest.Text = "Destination"
-    $lblDest.Location = New-Object System.Drawing.Point(10,158)
+    $lblDest.Location = New-Object System.Drawing.Point(10,144)
     $lblDest.Size = New-Object System.Drawing.Size(110,22)
     $lblDest.Font = $fontHeader
     $lblDest.BackColor = $script:t.Bg
@@ -710,7 +574,7 @@ try {
     $form.Controls.Add($lblDest)
 
     $txtDest = New-Object System.Windows.Forms.TextBox
-    $txtDest.Location = New-Object System.Drawing.Point(125,156)
+    $txtDest.Location = New-Object System.Drawing.Point(125,142)
     $txtDest.Size = New-Object System.Drawing.Size(845,26)
     $txtDest.Font = $fontRegular
     $txtDest.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -721,7 +585,7 @@ try {
     $form.Controls.Add($txtDest)
 
     $btnDest = New-Object System.Windows.Forms.Button
-    $btnDest.Location = New-Object System.Drawing.Point(980,154)
+    $btnDest.Location = New-Object System.Drawing.Point(980,140)
     $btnDest.Size = New-Object System.Drawing.Size(90,30)
     $btnDest.Text = "Browse"
     $btnDest.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
@@ -737,22 +601,12 @@ try {
     $form.Controls.Add($btnDest)
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5d - Option group boxes (Performance, Copy Options, Mode)
-    # --------------------------------------------------------------------
-    # Three group boxes stacked in the left column under the path rows:
-    #   Performance Mode  - /MT thread count (Performance / Restricted /
-    #                       Super Restricted = 18 / 9 / 4 threads)
-    #   Copy Options      - /COPY flag preset (Minimal D / Standard DAT /
-    #                       Secure DATS / Full DATSO)
-    #   Mode              - Standard (/E recurse) vs Mirror (/MIR, destructive)
-    # Each option has a small "?" help button that writes a detailed
-    # explanation to the status log on click. The help text is stored in
-    # the option's .Tag property so the help button's click handler can
-    # read it without duplicating the explanation in code.
+    # --- 5d. Option group boxes ---------------------------------------------
+
+    # Performance Mode: /MT level selection. MT:18 for SSD-to-SSD, MT:9 for
     # mixed, MT:4 for network/constrained boxes where MT:18 causes thrashing.
     $groupBoxPerformance = New-Object System.Windows.Forms.GroupBox
-    $groupBoxPerformance.Location = New-Object System.Drawing.Point(10,200)
+    $groupBoxPerformance.Location = New-Object System.Drawing.Point(10,180)
     $groupBoxPerformance.Size = New-Object System.Drawing.Size(280,110)
     # Leading spaces fake padding - GroupBox has no Padding property for its title.
     $groupBoxPerformance.Text = "  Performance Mode"
@@ -798,7 +652,7 @@ try {
 
     # Copy Options: /COPY flag preset. D=Data, A=Attrs, T=Times, S=Security, O=Owner.
     $groupBoxCopy = New-Object System.Windows.Forms.GroupBox
-    $groupBoxCopy.Location = New-Object System.Drawing.Point(10,320)
+    $groupBoxCopy.Location = New-Object System.Drawing.Point(10,300)
     $groupBoxCopy.Size = New-Object System.Drawing.Size(280,150)
     $groupBoxCopy.Text = "  Copy Options"
     $groupBoxCopy.Font = $fontHeader
@@ -879,7 +733,7 @@ try {
     # Putting it as a radio rather than a checkbox forces the user to
     # explicitly choose one mode. Mirror radio is rendered in red.
     $groupBoxMode = New-Object System.Windows.Forms.GroupBox
-    $groupBoxMode.Location = New-Object System.Drawing.Point(10,480)
+    $groupBoxMode.Location = New-Object System.Drawing.Point(10,460)
     $groupBoxMode.Size = New-Object System.Drawing.Size(280,90)
     $groupBoxMode.Text = "  Mode"
     $groupBoxMode.Font = $fontHeader
@@ -933,35 +787,29 @@ try {
     $tooltip.SetToolTip($btnFlags, "Show all Robocopy flags and what they do")
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5e - Bottom checkboxes (Create Log + Dry Run) and status log
-    # --------------------------------------------------------------------
-    # Two miscellaneous toggles that don't fit inside any of the option
-    # group boxes:
-    #   Create Log - adds /LOG+:<path>.txt to robocopy's command line so
-    #                a timestamped log file is appended in the destination
-    #                folder. On by default because a permanent record of
-    #                what was copied is almost always wanted.
-    #   Dry Run    - adds /L which makes robocopy list-only (no actual
-    #                copies, no timestamps changed, no deletions). Useful
-    #                for previewing what Mirror mode would delete before
-    #                running it for real.
-
+    # --- 5e. Checkboxes + status log ----------------------------------------
+    # Two option checkboxes (Create Log, Dry Run) sit on the left under the
+    # option group boxes, and the big status log fills the rest of the body to
+    # the right. The status log is the tool's main output surface: it shows the
+    # generated robocopy command, live progress text, the per-preset help when
+    # a "?" button is clicked, and the final summary. It is deliberately the
+    # ONLY thing that writes here during normal use - the mascot flavour lines
+    # go to the header subtitle instead so they never clutter real output.
     $chkLog = New-Object System.Windows.Forms.CheckBox
-    $chkLog.Location = New-Object System.Drawing.Point(14,580)
+    $chkLog.Location = New-Object System.Drawing.Point(14,560)
     $chkLog.Size = New-Object System.Drawing.Size(130,24)
     $chkLog.Text = "Create Log"
     $chkLog.Font = $fontRegular
     $chkLog.BackColor = $script:t.Bg
     $chkLog.ForeColor = $script:t.Text
-    $chkLog.Checked = $true   # Default ON - keep a record of every run.
+    $chkLog.Checked = $true
     $chkLog.Add_CheckedChanged({ $script:clickCount = 0 })
     $tooltip.SetToolTip($chkLog, "Save operation details to a log file in the destination folder")
     Register-Themed -Control $chkLog -Role "checkbox"
     $form.Controls.Add($chkLog)
 
     $chkDryRun = New-Object System.Windows.Forms.CheckBox
-    $chkDryRun.Location = New-Object System.Drawing.Point(150,580)
+    $chkDryRun.Location = New-Object System.Drawing.Point(150,560)
     $chkDryRun.Size = New-Object System.Drawing.Size(130,24)
     $chkDryRun.Text = "Dry Run"
     $chkDryRun.Font = $fontRegular
@@ -972,22 +820,16 @@ try {
     Register-Themed -Control $chkDryRun -Role "checkbox"
     $form.Controls.Add($chkDryRun)
 
-    # ----- Status log textbox -----
-    # Multi-line read-only TextBox that occupies the right two-thirds of
-    # the form. Used for:
-    #   - The command line being executed (at the start of each run)
-    #   - Robocopy's full output (read from /UNILOG: after the copy)
-    #   - The plain-English exit code decoder
-    #   - "Secret Rhino Message" easter eggs from the mascot
-    #   - Help text from the ? buttons next to each radio option
-    # Anchored to all four sides so it grows when the form is resized.
-    # Consolas mono font so robocopy's column-aligned output lines up
-    # cleanly. FixedSingle border for a clean inset look.
+    # Status log - Consolas mono so Robocopy's column-aligned output lines up.
+    # Height is set so its bottom edge (180 + 560 = 740) lines up with the
+    # bottom of the Cancel button in the left column, so the log fills the
+    # whole right side instead of stranding empty space beneath it. The
+    # Top+Bottom+Left+Right anchor then grows it with the window.
     $txtStatus = New-Object System.Windows.Forms.TextBox
     $txtStatus.Multiline = $true
     $txtStatus.ScrollBars = "Vertical"
-    $txtStatus.Location = New-Object System.Drawing.Point(300,200)
-    $txtStatus.Size = New-Object System.Drawing.Size(770,315)
+    $txtStatus.Location = New-Object System.Drawing.Point(300,180)
+    $txtStatus.Size = New-Object System.Drawing.Size(770,560)
     $txtStatus.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $txtStatus.Font = $fontMono
     $txtStatus.ReadOnly = $true
@@ -999,43 +841,26 @@ try {
     $form.Controls.Add($txtStatus)
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5f - Action buttons (Copy Files, Copy Command, Cancel/Clear)
-    # --------------------------------------------------------------------
-    # Three buttons stacked in the left column under the option groups:
-    #   1. Copy Files (primary green) - validates inputs and runs the copy
-    #   2. Copy Command to Clipboard (accent blue) - puts the robocopy
-    #      command string on the clipboard for users learning the tool
-    #   3. Cancel/Clear (dual-purpose) - shows "Cancel Operation" in red
-    #      during a running copy, "Clear Log" in neutral when idle
-    # All three anchored Bottom|Left so they stay pinned to the
-    # bottom-left corner on resize.
+    # --- 5f. Action buttons -------------------------------------------------
+    # Three stacked buttons down the left column under the checkboxes:
+    #   Copy Files (green)        - validates the paths then runs Execute-Copy.
+    #   Copy Command (blue)       - builds the robocopy command and puts it on
+    #                               the clipboard without running anything, for
+    #                               pasting into a script or a remote session.
+    #   Cancel Operation (red)    - kills the running robocopy child process;
+    #                               disabled unless a copy is actually running.
+    # Each path-using handler runs the same three validation checks (both paths
+    # supplied, source exists, destination exists) and bails with a MessageBox
+    # if any fail, so a bad path can never reach robocopy.
 
-    # ----- Primary action: Copy Files -----
-    # The big green button. Validates source/dest paths, then calls
-    # Execute-Copy which runs robocopy synchronously and updates the GUI
-    # with output and exit code analysis.
-    #
-    # Validation rules (run in order, first failure shows a MessageBox
-    # and aborts without proceeding):
-    #   1. Both paths must be non-empty
-    #   2. Source path must exist on disk
-    #   3. Destination path must exist on disk
-    # We deliberately do NOT auto-create the destination because that
-    # could mask typos that would otherwise be caught here.
-    #
-    # The Execute-Copy call is wrapped in try/catch. Any exception is
-    # written to the status log and buttons are reset to idle state, so
-    # the form stays open and usable even if robocopy fails catastrophically.
     $btnCopy = New-Object System.Windows.Forms.Button
-    $btnCopy.Location = New-Object System.Drawing.Point(20,620)
+    $btnCopy.Location = New-Object System.Drawing.Point(20,600)
     $btnCopy.Size = New-Object System.Drawing.Size(260,44)
     $btnCopy.Text = "Copy Files"
     $btnCopy.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
     Apply-ButtonTheme -Button $btnCopy -Role "btn-success"
     Register-Themed -Control $btnCopy -Role "btn-success"
     $btnCopy.Add_Click({
-        # Validate inputs before doing anything.
         if (-not $txtSource.Text -or -not $txtDest.Text) { [System.Windows.Forms.MessageBox]::Show("Please specify both source and destination paths.", "Invalid Paths", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
         if (-not (Test-Path $txtSource.Text)) { [System.Windows.Forms.MessageBox]::Show("Source path '$($txtSource.Text)' does not exist.", "Invalid Source Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
         if (-not (Test-Path $txtDest.Text)) { [System.Windows.Forms.MessageBox]::Show("Destination path '$($txtDest.Text)' does not exist or is inaccessible.", "Invalid Destination Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
@@ -1047,32 +872,21 @@ try {
             Execute-Copy -DryRun:$chkDryRun.Checked
         } catch {
             try { $txtStatus.AppendText("`r`n[Error during copy: $($_.Exception.Message)]`r`n") } catch { }
-            try { $btnCopy.Enabled = $true; Set-ButtonClearMode } catch { }
+            try { $btnCopy.Enabled = $true; $btnCancel.Enabled = $false } catch { }
         }
         $script:clickCount = 0
     })
     $tooltip.SetToolTip($btnCopy, "Start the file copy operation")
     $form.Controls.Add($btnCopy)
 
-    # ----- Secondary action: Copy Command to Clipboard -----
-    # For users learning robocopy. Builds the same robocopy command line
-    # that Execute-Copy would run and puts it on the clipboard. The user
-    # can paste it into a cmd prompt to run it manually, inspect what
-    # flags are being passed, save it into a script, etc.
-    # Generate-Command (defined in 5g) builds the actual string and uses
-    # the same Get-RobocopyFlagsFromUI helper as Execute-Copy, so the
-    # displayed command is guaranteed to match what would really run.
     $btnCopyCmd = New-Object System.Windows.Forms.Button
-    $btnCopyCmd.Location = New-Object System.Drawing.Point(20,672)
+    $btnCopyCmd.Location = New-Object System.Drawing.Point(20,652)
     $btnCopyCmd.Size = New-Object System.Drawing.Size(260,40)
     $btnCopyCmd.Text = "Copy Command to Clipboard"
     $btnCopyCmd.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
     Apply-ButtonTheme -Button $btnCopyCmd -Role "btn-accent"
     Register-Themed -Control $btnCopyCmd -Role "btn-accent"
     $btnCopyCmd.Add_Click({
-        # Same path validation as the Copy Files button. Even though we
-        # are not actually running anything, an invalid path would produce
-        # a garbage command string the user could accidentally run.
         if (-not $txtSource.Text -or -not $txtDest.Text) { [System.Windows.Forms.MessageBox]::Show("Please specify both source and destination paths.", "Invalid Paths", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
         if (-not (Test-Path $txtSource.Text)) { [System.Windows.Forms.MessageBox]::Show("Source path '$($txtSource.Text)' does not exist.", "Invalid Source Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
         if (-not (Test-Path $txtDest.Text)) { [System.Windows.Forms.MessageBox]::Show("Destination path '$($txtDest.Text)' does not exist or is inaccessible.", "Invalid Destination Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning); return }
@@ -1086,132 +900,43 @@ try {
     $tooltip.SetToolTip($btnCopyCmd, "Copy the Robocopy command to clipboard")
     $form.Controls.Add($btnCopyCmd)
 
-    # ----- Dual-purpose button: Cancel (during run) / Clear (when idle) -----
-    # The same button changes role depending on whether a copy is in
-    # progress. The .Tag property holds the current mode ("cancel" or
-    # "clear") so the click handler can dispatch:
-    #   - In CANCEL mode: prompts for confirmation, then kills the
-    #     running robocopy process. The Execute-Copy wait loop will
-    #     notice HasExited and unwind, calling Set-ButtonClearMode.
-    #   - In CLEAR mode: wipes the status log box and resets the progress
-    #     label back to "Ready". This fixes the annoying behaviour where
-    #     a completion message from hours ago kept hanging around in the
-    #     header until the next copy run.
-    # Default state is Clear because that's what's appropriate when no
-    # copy is running. Execute-Copy flips it to Cancel mode on entry
-    # via Set-ButtonCancelMode (defined just below this block).
-    $btnCancelClear = New-Object System.Windows.Forms.Button
-    $btnCancelClear.Location = New-Object System.Drawing.Point(20,720)
-    $btnCancelClear.Size = New-Object System.Drawing.Size(260,40)
-    $btnCancelClear.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
-    $btnCancelClear.Tag = "clear"
-    $btnCancelClear.Text = "Clear Log"
-    Apply-ButtonTheme -Button $btnCancelClear -Role "btn-neutral"
-    Register-Themed -Control $btnCancelClear -Role "btn-neutral"
-    $btnCancelClear.Add_Click({
-        if ($btnCancelClear.Tag -eq "cancel") {
-            # CANCEL mode: kill the running robocopy process.
-            if ($script:process -ne $null -and -not $script:process.HasExited) {
-                $result = [System.Windows.Forms.MessageBox]::Show("Are you sure you want to cancel the copy operation?", "Confirm Cancel", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-                if ($result -eq 'Yes') {
-                    try { $script:process.Kill() } catch { }
-                    $txtStatus.AppendText("`r`n`r`nOperation cancelled by user.")
-                    $lblProgress.Text = "Cancelled"
-                    $lblProgress.ForeColor = $script:t.Danger
-                    # The DoEvents loop in Execute-Copy will notice HasExited
-                    # and unwind on its own, calling Set-ButtonClearMode.
-                }
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Location = New-Object System.Drawing.Point(20,700)
+    $btnCancel.Size = New-Object System.Drawing.Size(260,40)
+    $btnCancel.Text = "Cancel Operation"
+    $btnCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+    $btnCancel.Enabled = $false
+    Apply-ButtonTheme -Button $btnCancel -Role "btn-danger"
+    Register-Themed -Control $btnCancel -Role "btn-danger"
+    $btnCancel.Add_Click({
+        if ($script:process -ne $null -and -not $script:process.HasExited) {
+            $result = [System.Windows.Forms.MessageBox]::Show("Are you sure you want to cancel the copy operation?", "Confirm Cancel", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($result -eq 'Yes') {
+                try { $script:process.Kill() } catch { }
+                $txtStatus.AppendText("`r`n`r`nOperation cancelled by user.")
+                $btnCancel.Enabled = $false
+                $btnCopy.Enabled = $true
+                $lblProgress.Text = "Cancelled"
+                # Use $script:t.Danger so colour stays theme-appropriate after a switch.
+                $lblProgress.ForeColor = $script:t.Danger
             }
-        } else {
-            # CLEAR mode: wipe the status log box and reset the progress
-            # label so it doesn't keep showing a stale "Completed (exit N)"
-            # from hours ago.
-            $txtStatus.Clear()
-            $txtStatus.Text = "Ready to copy files. Select source and destination paths to begin."
-            $progressBar.Value = 0
-            $lblProgress.Text = "Ready"
-            $lblProgress.ForeColor = $script:t.Muted
-            $script:clickCount = 0
         }
     })
-    $tooltip.SetToolTip($btnCancelClear, "Clear the status log and reset the progress display")
-    $form.Controls.Add($btnCancelClear)
-
-    # --------------------------------------------------------------------
-    # Set-ButtonCancelMode / Set-ButtonClearMode
-    # --------------------------------------------------------------------
-    # Helpers to flip the dual-purpose Cancel/Clear button between its
-    # two modes. They MUST be defined here (inside the form-build try
-    # block) because they reference $btnCancelClear and $tooltip which
-    # are in this scope.
-    #
-    # Each helper updates four things:
-    #   1. The .Tag property (read by the click handler to dispatch)
-    #   2. The button text
-    #   3. The button colour (via Apply-ButtonTheme)
-    #   4. The button's role in $script:themedControls so the theme
-    #      toggle paints it correctly while in the new mode
-    #   5. The tooltip text
-    # --------------------------------------------------------------------
-
-    # Set-ButtonCancelMode
-    # --------------------
-    # Called by Execute-Copy on entry. Turns the button red and labels
-    # it "Cancel Operation".
-    function Set-ButtonCancelMode {
-        $btnCancelClear.Tag = "cancel"
-        $btnCancelClear.Text = "Cancel Operation"
-        Apply-ButtonTheme -Button $btnCancelClear -Role "btn-danger"
-        # Update the role in the themed-controls registry too, so if the
-        # user toggles light/dark while a copy is running, Apply-Theme
-        # repaints the button with the danger-coloured palette.
-        foreach ($entry in $script:themedControls) {
-            if ($entry.Control -eq $btnCancelClear) { $entry.Role = "btn-danger" }
-        }
-        $tooltip.SetToolTip($btnCancelClear, "Cancel the running copy operation")
-    }
-
-    # Set-ButtonClearMode
-    # -------------------
-    # Called by Execute-Copy on exit (after the copy finishes or fails).
-    # Turns the button neutral and labels it "Clear Log".
-    function Set-ButtonClearMode {
-        $btnCancelClear.Tag = "clear"
-        $btnCancelClear.Text = "Clear Log"
-        Apply-ButtonTheme -Button $btnCancelClear -Role "btn-neutral"
-        foreach ($entry in $script:themedControls) {
-            if ($entry.Control -eq $btnCancelClear) { $entry.Role = "btn-neutral" }
-        }
-        $tooltip.SetToolTip($btnCancelClear, "Clear the status log and reset the progress display")
-    }
+    $tooltip.SetToolTip($btnCancel, "Cancel the running copy operation")
+    $form.Controls.Add($btnCancel)
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5g - Functions: Execute-Copy and friends
-    # --------------------------------------------------------------------
-    # The actual copy logic lives here. Defined inside the form-build try
-    # block so it has $form, $txtStatus, $progressBar, etc. in scope.
-    # PowerShell hoists function definitions to their containing scope at
-    # parse time, so click handlers above this point can reference these
-    # functions even though they appear later in source order.
+    # --- 5g. Functions ------------------------------------------------------
 
-    # Execute-Copy
-    # ------------
-    # The main copy logic. Reads UI state via Get-RobocopyFlagsFromUI,
-    # builds the robocopy command, runs robocopy as a synchronous child
-    # process (via Start-Process), animates a working progress bar while
-    # it runs, then displays the output and exit code analysis.
-    #
-    # CRITICAL: robocopy is launched synchronously, NOT with async stream
-    # redirection. See HANDOFF.md for the full story - using
-    # BeginOutputReadLine + $form.Invoke from PowerShell 5.1 caused fatal
-    # threadpool races that killed powershell.exe outright. Do not change
-    # to async without understanding the prior crash.
+    # Execute-Copy: builds Robocopy args from UI state, spawns process with
+    # redirected stdout/stderr, pumps output to log + progress bar live.
+    # Uses System.Diagnostics.Process directly (not Start-Process) because
+    # we need synchronous access to redirected streams for live tailing.
     function Execute-Copy {
         param([bool]$DryRun)
 
         $btnCopy.Enabled = $false
-        Set-ButtonCancelMode
+        $btnCancel.Enabled = $true
         # Marquee animation - the chevron-style scrolling bar. No real progress
         # info needed (robocopy doesn't reliably emit total %, and a pre-scan
         # is misleadingly slow on big trees). The animation just tells the
@@ -1221,37 +946,29 @@ try {
         $lblProgress.ForeColor = $script:t.Accent
         $txtStatus.Clear()
 
-        # Build /COPY flag and recurse flag from UI state via the shared
-        # helper. Both Execute-Copy (here) and Generate-Command use this
-        # single source of truth so the displayed clipboard command and
-        # the actually-executed command cannot diverge.
-        $f = Get-RobocopyFlagsFromUI
+        # Build /COPY flag from radio selection. Default to DAT.
+        $copyFlags = if ($radioCopyMinimal.Checked) { "D" } elseif ($radioCopyStandard.Checked) { "DAT" } elseif ($radioCopySecure.Checked) { "DATS" } elseif ($radioCopyFull.Checked) { "DATSO" } else { "DAT" }
+        $recurseFlag = if ($radioModeMirror.Checked) { "/MIR" } else { "/E" }
 
         # Build robocopy command and run as a real child process.
         # We do NOT redirect stdout/stderr to PowerShell - robocopy writes
         # to its own log file. This avoids the PowerShell async stream race
         # that previously crashed the host. The user-facing log (when ticked)
         # is also robocopy's own /LOG+ output, written to the destination.
-        # /UNILOG: writes the unicode log to a temp file we read back later
-        # to display robocopy's output in the GUI status box.
         $progressLog = Join-Path $env:TEMP "RhinoCopy_progress_$([Guid]::NewGuid().ToString('N')).log"
-        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*",
-                    "/COPY:$($f.CopyFlags)", "/DCOPY:$($f.CopyFlags)",
-                    $f.RecurseFlag, "/XJ", "/W:1", "/R:10", "/NP", "/NDL",
-                    $f.MtFlag, "/UNILOG:$progressLog")
-        # User-facing log (separate from the /UNILOG: temp file). When ticked,
-        # robocopy /LOG+: appends its standard output to a timestamped file
-        # in the destination folder for the user to keep.
+        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$copyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10", "/NP", "/NDL", "/UNILOG:$progressLog")
+        if ($radioPerformance.Checked) { $rcArgs += "/MT:18" } elseif ($radioRestricted.Checked) { $rcArgs += "/MT:9" } elseif ($radioSuperRestricted.Checked) { $rcArgs += "/MT:4" }
+        # User-facing log (separate from the polling log written to %TEMP%).
         $userLogFile = $null
         if ($chkLog.Checked) {
             $userLogFile = Join-Path $txtDest.Text "RhinoCopy_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
             $rcArgs += "/LOG+:$userLogFile"
         }
-        if ($DryRun) { $rcArgs += "/L" }   # /L = list-only mode (dry run)
+        if ($DryRun) { $rcArgs += "/L" }
 
         # Build the displayed command string. Always quotes paths.
         $command = Format-RobocopyCommand -ArgList $rcArgs
-        $txtStatus.AppendText("Running:`r`n$command`r`n")
+        $txtStatus.AppendText("Running:`r`n$command`r`n`r`nThe form will stay responsive while robocopy runs. The animation below means it is working - not frozen.`r`n")
         $txtStatus.Refresh()
 
         $startTime = Get-Date
@@ -1264,7 +981,6 @@ try {
         # Use ASCII characters for the spinner so it renders correctly in any
         # font - Unicode braille spinners look great but only in Consolas/mono.
         $script:animFrame = 0
-        $script:animVerb = ''
         $spinnerFrames = @('|', '/', '-', '\')
         $dotsFrames    = @('   ', '.  ', '.. ', '...')
         $verbFrames    = @(
@@ -1277,39 +993,7 @@ try {
             'Asking robocopy nicely',
             'Avoiding junction loops',
             'Probably almost done',
-            "Don't quit on me now",
-            'Bribing the disk controller',
-            'Negotiating with the kernel',
-            'Reticulating splines',
-            'Convincing bits to move',
-            'Yelling at the disk',
-            'Waking up the drive heads',
-            'Whispering sweet nothings to the file system',
-            'Conjuring inodes',
-            "It's giving 110%",
-            'Performing CPR on slow files',
-            'Politely queueing',
-            'Looking busy',
-            'Doing the needful',
-            'Trust me bro',
-            'Almost there (no really)',
-            'Just one more file',
-            'Counting in binary',
-            'Stretching before the next folder',
-            'Cracking knuckles',
-            'Manifesting good outcomes',
-            'Vibing with the spindle',
-            "Files are people too, you know",
-            'Therapising stuck handles',
-            'Buffering optimism',
-            'Optimising morale',
-            'Defragging vibes',
-            'Sweet-talking the cluster size',
-            'Beep boop',
-            'Hold my beer',
-            'This is fine',
-            'Definitely not stuck',
-            'Crossing fingers and toes'
+            "Don't quit on me now"
         )
 
         $animTimer = New-Object System.Windows.Forms.Timer
@@ -1319,17 +1003,14 @@ try {
                 $script:animFrame++
                 $spin = $spinnerFrames[$script:animFrame % $spinnerFrames.Count]
                 $dots = $dotsFrames[$script:animFrame % $dotsFrames.Count]
-                # Pick a fresh random verb every ~2.4s. Pick on tick 0 too so
-                # we don't show an empty string on the first paint.
-                if ($script:animVerb -eq '' -or $script:animFrame % 12 -eq 0) {
-                    $script:animVerb = $verbFrames | Get-Random
-                }
+                # Rotate the verb every ~8 frames (~1.6s) so it has time to read.
+                $verb = $verbFrames[[math]::Floor($script:animFrame / 8) % $verbFrames.Count]
                 $elapsed = (Get-Date) - $startTime
                 $elapsedStr = "{0:mm\:ss}" -f $elapsed
                 if ($DryRun) {
-                    $lblProgress.Text = "$spin  Dry run: $($script:animVerb)$dots  ($elapsedStr)"
+                    $lblProgress.Text = "$spin  Dry run: $verb$dots  ($elapsedStr)"
                 } else {
-                    $lblProgress.Text = "$spin  $($script:animVerb)$dots  ($elapsedStr)"
+                    $lblProgress.Text = "$spin  $verb$dots  ($elapsedStr)"
                 }
             } catch { }
         })
@@ -1376,42 +1057,18 @@ try {
         if ($output) { $txtStatus.AppendText($output) } else { $txtStatus.AppendText("(no output captured)`r`n") }
         $txtStatus.AppendText("`r`n" + ("="*60) + "`r`n")
         $txtStatus.AppendText("Operation completed with exit code: $exitCode (elapsed: $totalElapsed)`r`n`r`n")
-
-        # Robocopy exit codes are bit flags. Build two parallel lists:
-        # - $bitsHit: the individual bit values that fired (e.g. 1, 2)
-        # - $bitLabels: short label per bit for the headline math
-        # - $explanation: full sentence per bit for the breakdown
-        $bitsHit = @()
-        $bitLabels = @()
+        # Robocopy exit codes are bit flags. Decode them in plain English.
         $explanation = @()
-        if ($exitCode -band 1)  { $bitsHit += 1;  $bitLabels += "files copied";        $explanation += "[+1] Files were copied successfully." }
-        if ($exitCode -band 2)  { $bitsHit += 2;  $bitLabels += "extras in dest";      $explanation += "[+2] Extra files or folders were detected in the destination (not in source). With Mirror mode these were deleted; otherwise they were left untouched." }
-        if ($exitCode -band 4)  { $bitsHit += 4;  $bitLabels += "mismatches";          $explanation += "[+4] Mismatched files or folders were detected. Examine the log to investigate." }
-        if ($exitCode -band 8)  { $bitsHit += 8;  $bitLabels += "copy errors";         $explanation += "[+8] Some files or folders could not be copied (e.g. access denied, in use). Check the log for details." }
-        if ($exitCode -band 16) { $bitsHit += 16; $bitLabels += "fatal error";         $explanation += "[+16] Serious error - robocopy did not copy any files. Usually invalid command line or insufficient access to source/destination." }
-
-        # Headline: explain WHY the exit code is the number it is.
-        if ($exitCode -eq 0) {
-            $txtStatus.AppendText("What exit code 0 means: nothing was copied because source and destination are already in sync. No errors, no changes needed.`r`n`r`n")
-        } elseif ($exitCode -lt 0) {
-            $txtStatus.AppendText("What exit code $exitCode means: robocopy did not run or exited abnormally. Check that source and destination paths are valid.`r`n`r`n")
-            $explanation += "Robocopy did not run, or exited abnormally. Check that the source and destination paths are valid."
-        } elseif ($bitsHit.Count -eq 1) {
-            # Single bit set - just one thing happened.
-            $txtStatus.AppendText("What exit code $exitCode means: $($bitLabels[0]).`r`n`r`n")
-        } else {
-            # Multiple bits OR'd together - show the math so the user sees
-            # WHY 1+2 = 3, why 8+16 = 24, etc.
-            $sum = ($bitsHit -join " + ")
-            $labels = ($bitLabels -join " + ")
-            $txtStatus.AppendText("What exit code $exitCode means: $sum = $exitCode  (i.e. $labels).`r`n")
-            $txtStatus.AppendText("Robocopy adds the bit values of every condition that occurred. Breakdown:`r`n`r`n")
-        }
-
-        if ($explanation.Count -gt 0) {
-            foreach ($line in $explanation) { $txtStatus.AppendText("  - $line`r`n") }
-            $txtStatus.AppendText("`r`n")
-        }
+        if ($exitCode -eq 0) { $explanation += "No files were copied. Source and destination are already in sync." }
+        if ($exitCode -band 1)  { $explanation += "[+1] Files were copied successfully." }
+        if ($exitCode -band 2)  { $explanation += "[+2] Extra files or folders were detected in the destination (not in source). With Mirror mode these were deleted; otherwise they were left untouched." }
+        if ($exitCode -band 4)  { $explanation += "[+4] Mismatched files or folders were detected. Examine the log to investigate." }
+        if ($exitCode -band 8)  { $explanation += "[+8] Some files or folders could not be copied (e.g. access denied, in use). Check the log for details." }
+        if ($exitCode -band 16) { $explanation += "[+16] Serious error - robocopy did not copy any files. Usually invalid command line or insufficient access to source/destination." }
+        if ($exitCode -lt 0)    { $explanation += "Robocopy did not run, or exited abnormally. Check that the source and destination paths are valid." }
+        $txtStatus.AppendText("What this means:`r`n")
+        foreach ($line in $explanation) { $txtStatus.AppendText("  - $line`r`n") }
+        $txtStatus.AppendText("`r`n")
         if ($userLogFile) { $txtStatus.AppendText("Full log saved to: $userLogFile`r`n`r`n") }
 
         if ($exitCode -ge 0 -and $exitCode -le 7) {
@@ -1431,7 +1088,7 @@ try {
         $txtStatus.ScrollToCaret()
 
         $btnCopy.Enabled = $true
-        Set-ButtonClearMode
+        $btnCancel.Enabled = $false
     }
 
     # Format an argument array as a single command-line string suitable for
@@ -1442,57 +1099,6 @@ try {
     #   the switch prefix is left alone.
     # - Plain switches like /E, /MT:18, /COPY:DAT: not quoted.
     # The result matches what a person would type by hand on the cmd line.
-    # ----------------------------------------------------------------------
-    # Get-RobocopyFlagsFromUI
-    # ----------------------------------------------------------------------
-    # Single source of truth for translating the UI radio/checkbox state into
-    # robocopy flag values. Both Execute-Copy (which actually runs robocopy)
-    # and Generate-Command (which builds the clipboard string) call this so
-    # they cannot drift apart.
-    #
-    # Returns a hashtable with these keys:
-    #   CopyFlags    - "D" / "DAT" / "DATS" / "DATSO" (no leading /COPY:)
-    #   RecurseFlag  - "/E" or "/MIR"
-    #   MtFlag       - "/MT:18" / "/MT:9" / "/MT:4" (always set since one
-    #                  Performance radio is always checked)
-    # ----------------------------------------------------------------------
-    function Get-RobocopyFlagsFromUI {
-        # /COPY:flags preset. The four radios are mutually exclusive and one
-        # is always checked by default, but we include an "else" fallback to
-        # DAT just in case something pathological happens (e.g. all unchecked
-        # via Tab + Space keyboard interaction we didn't anticipate).
-        $cf = if ($radioCopyMinimal.Checked)  { "D" }
-              elseif ($radioCopyStandard.Checked) { "DAT" }
-              elseif ($radioCopySecure.Checked)   { "DATS" }
-              elseif ($radioCopyFull.Checked)     { "DATSO" }
-              else { "DAT" }
-
-        # Recursion mode. /E = standard (keep extras), /MIR = mirror (delete
-        # extras in destination that are not in source).
-        $rf = if ($radioModeMirror.Checked) { "/MIR" } else { "/E" }
-
-        # Multi-thread count. Same fallback story as $cf.
-        $mt = if ($radioPerformance.Checked)       { "/MT:18" }
-              elseif ($radioRestricted.Checked)    { "/MT:9" }
-              elseif ($radioSuperRestricted.Checked) { "/MT:4" }
-              else { "/MT:18" }
-
-        return @{ CopyFlags = $cf; RecurseFlag = $rf; MtFlag = $mt }
-    }
-
-    # ----------------------------------------------------------------------
-    # Format-RobocopyCommand
-    # ----------------------------------------------------------------------
-    # Format an argument array as a single command-line string suitable for
-    # display in the status log or pasting into cmd.exe. Quoting rules:
-    #   - First two positional args (source, destination): ALWAYS wrapped in
-    #     quotes for consistency, even if they have no whitespace.
-    #   - /LOG, /LOG+, /UNILOG, /UNILOG+: path portion after the colon is
-    #     wrapped in quotes; the switch prefix is left bare. This matches
-    #     what someone would type by hand on the command line.
-    #   - Anything else containing whitespace: whole token wrapped in quotes.
-    #   - Plain switches like /E, /MT:18, /COPY:DAT: not quoted.
-    # ----------------------------------------------------------------------
     function Format-RobocopyCommand {
         param([string[]]$ArgList)
         $parts = @("robocopy")
@@ -1514,21 +1120,13 @@ try {
         return $parts -join " "
     }
 
-    # ----------------------------------------------------------------------
-    # Generate-Command
-    # ----------------------------------------------------------------------
-    # Builds the display string for the "Copy Command to Clipboard" button.
-    # Intentionally omits /NP and /NDL (which Execute-Copy includes for
-    # cleaner internal output) because a user pasting this into cmd probably
-    # wants robocopy's full default progress and directory listing output.
-    # Intentionally omits /UNILOG: because that's an internal artifact path
-    # only relevant when RhinoCopy itself is driving the run.
-    # ----------------------------------------------------------------------
+    # Generate-Command: display string for clipboard copy. Omits /NP /NDL
+    # because a user pasting this into cmd probably wants full output.
     function Generate-Command {
-        $f = Get-RobocopyFlagsFromUI
-        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*",
-                    "/COPY:$($f.CopyFlags)", "/DCOPY:$($f.CopyFlags)",
-                    $f.RecurseFlag, "/XJ", "/W:1", "/R:10", $f.MtFlag)
+        $copyFlags = if ($radioCopyMinimal.Checked) { "D" } elseif ($radioCopyStandard.Checked) { "DAT" } elseif ($radioCopySecure.Checked) { "DATS" } elseif ($radioCopyFull.Checked) { "DATSO" } else { "DAT" }
+        $recurseFlag = if ($radioModeMirror.Checked) { "/MIR" } else { "/E" }
+        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$copyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10")
+        if ($radioPerformance.Checked) { $rcArgs += "/MT:18" } elseif ($radioRestricted.Checked) { $rcArgs += "/MT:9" } elseif ($radioSuperRestricted.Checked) { $rcArgs += "/MT:4" }
         if ($chkLog.Checked) {
             $logFile = Join-Path $txtDest.Text "RhinoCopy_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
             $rcArgs += "/LOG+:$logFile"
@@ -1702,53 +1300,21 @@ For full official documentation:
         $ref.AcceptButton = $btnClose
         $ref.CancelButton = $btnClose
 
-        # When the form first shows, WinForms auto-selects the entire TextBox
-        # content because it gets initial focus. Counter this on the Shown
-        # event: focus the Close button instead, and reset the TextBox
-        # selection to position 0 with zero length so nothing is highlighted.
-        $ref.Add_Shown({
-            try {
-                $btnClose.Focus() | Out-Null
-                $tb.SelectionStart = 0
-                $tb.SelectionLength = 0
-                $tb.ScrollToCaret()
-            } catch { }
-        })
-
         $ref.ShowDialog($form) | Out-Null
         $ref.Dispose()
     }
 
 
-    # --------------------------------------------------------------------
-    # SECTION 5h - ShowDialog: the modal blocking call
-    # --------------------------------------------------------------------
-    # ShowDialog() runs the WinForms message loop and BLOCKS until the
-    # form is closed. While it blocks, all UI interaction happens via the
-    # event handlers we wired up above. When the user closes the form,
-    # ShowDialog returns and we fall through to the end of the try block.
-    # Out-Null suppresses the DialogResult return value which we don't use.
+    # --- 5h. ShowDialog (blocking) ------------------------------------------
     $form.ShowDialog() | Out-Null
 
 } catch {
-    # ========================================================================
-    # SECTION 6 - Outer catch: startup crash log
-    # ========================================================================
-    # Any uncaught error during form construction (Section 5) lands here.
-    # This is essentially a last-resort safety net for unexpected failures
-    # like missing .NET assemblies, broken icon files that throw on load,
-    # or anything else exotic.
-    #
-    # Order matters: we write to the temp log file FIRST and the
-    # MessageBox SECOND, because:
-    #   - If WinForms itself is broken (e.g. SetCompatibleTextRenderingDefault
-    #     blew up), the MessageBox call will also throw, and the log file
-    #     is then the only diagnostic trail left behind.
-    #   - When launched with -WindowStyle Hidden via the desktop shortcut,
-    #     there is no console output anyway, so the log is the only way
-    #     to find out why nothing happened.
-    # Both calls are wrapped in their own try/catch so one failing doesn't
-    # prevent the other from running.
+    # =========================================================================
+    # SECTION 6 - Startup crash log
+    # =========================================================================
+    # Any uncaught error in form build lands here. Write to temp log FIRST -
+    # if the form system itself is broken, the MessageBox may also throw and
+    # the log is the only diagnostic trail, especially with -WindowStyle Hidden.
     $errMsg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RhinoCopy startup error: $($_ | Out-String)"
     try { Add-Content -Path $crashLog -Value $errMsg -Encoding UTF8 } catch { }
     try { [System.Windows.Forms.MessageBox]::Show("An error occurred: $_`r`n`r`nDetails logged to:`r`n$crashLog", "RhinoCopy Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null } catch { }

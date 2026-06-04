@@ -118,7 +118,34 @@ The original Browse-by-Client flow is preserved as a secondary panel.
 
 ---
 
+## RhinoDrain
+
+**`RhinoDrain/RhinoDrain.ps1`** — v1.0
+
+A GUI front-end for managing RDS session host drain mode. *"Pool's closed."* — blocks new logons on a host so users naturally land on the other hosts in the collection, then reopens it when the box is healthy again.
+
+Built to the [Rhino Design Brief](Shared/Rhino_DesignBrief.md). Theme system, button helper, async pattern, FormClosing guard, and activity log all lifted directly from RhinoShadow so the two tools feel identical to operate.
+
+**The workflow:**
+1. On launch RhinoDrain probes the configured connection brokers and auto-picks whichever one has the RDS deployment.
+2. Pick a collection from the dropdown (type to filter).
+3. The grid lists every session host with its New Connections state (green=Yes, red=No) and a live user-session count.
+4. Tick the hosts you want to act on, then **Block Selected** / **Allow Selected**. "Block All Except Selected" funnels everyone onto the host(s) you tick.
+5. When maintenance is done, hit **Allow All (Open Pool)** — reopens every host, re-reads state, and tells you in plain words whether the pool is fully open or which hosts are still blocked.
+
+**Honesty pattern:** `Set-RDSessionHost` returns no useful failure signal on its own, so after every change RhinoDrain re-reads the host's state and compares it against what was asked for. If a Set "succeeded" but state didn't actually change, the activity log flags it as an error instead of falsely logging OK.
+
+**Important:** Blocking only stops NEW logons. Existing sessions stay until they disconnect or are signed out. Use RhinoShadow for forced sign-outs — RhinoDrain only herds new traffic.
+
+*Made by Jared. Requires the RDS PowerShell module on the local machine and broker connectivity.*
+
+---
+
 ## Shared
+
+**`Shared/Rhino_DesignBrief.md`**
+
+The visual language, engineering patterns, and design philosophy that all Rhino tools share. Covers the colour palette (dark + light), typography, layout, button roles, script structure, logging conventions, destructive-action rules, configuration-block format, identifying-info policy, anti-patterns, and what "looks Rhino" vs "feels Rhino" means. Read this first before building a new tool in the family.
 
 **`Shared/SecretRhinoMessages.ps1`**
 
