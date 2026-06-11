@@ -384,20 +384,64 @@ $script:rdsWorker = {
     $out = @{ Error = $null; SetResults = @(); Hosts = @() }
     Import-Module RemoteDesktop -ErrorAction SilentlyContinue
 
-    # 1. Apply the requested changes. Each Set is independent: one failing
-    #    host must not stop the others, so each gets its own try/catch and a
-    #    recorded result. Set-RDSessionHost emits no reliable success signal,
-    #    which is why verification happens in step 2 by re-reading state.
-    foreach ($item in @($setList)) {
-        if ($null -eq $item) { continue }
-        $r = @{ Host = $item.Host; Desired = $item.Desired; Ok = $false; Error = $null }
-        try {
-            Set-RDSessionHost -SessionHost $item.Host -ConnectionBroker $broker -NewConnectionAllowed $item.Desired -ErrorAction Stop
-            $r.Ok = $true
-        } catch {
-            $r.Error = $_.Exception.Message
+    # 1. Apply the requested changes IN PARALLEL via a child runspace pool.
+    #    Each Set is an independent broker RPC and there is no ordering
+    #    requirement between them, so running them sequentially is pure dead
+    #    time on multi-host actions (Block All Except Selected, Open Pool,
+    #    etc). A 20-host action that used to do 20 serial RPCs now does ~one
+    #    RPC's worth of wall time, capped by $maxSetThreads concurrent calls
+    #    to keep from hammering the broker.
+    #
+    #    InitialSessionState pre-loads RemoteDesktop into the pool once, so
+    #    the worker scriptblocks do NOT each pay the (slow) cold-import
+    #    cost. Without this every parallel runspace would re-import.
+    #
+    #    Each Set still gets its own try/catch and a recorded result, so one
+    #    failing host does not poison the others, and Set-RDSessionHost's
+    #    lack of a reliable success signal is still verified against the
+    #    re-read in step 2.
+    $items = @(@($setList) | Where-Object { $null -ne $_ })
+    if ($items.Count -gt 0) {
+        $maxSetThreads = 8
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $iss.ImportPSModule('RemoteDesktop')
+        $pool = [runspacefactory]::CreateRunspacePool($iss)
+        $pool.SetMinRunspaces(1)  | Out-Null
+        $pool.SetMaxRunspaces([Math]::Min($items.Count, $maxSetThreads)) | Out-Null
+        $pool.Open()
+        $setScript = {
+            param($targetHost, $b, $desired)
+            $r = @{ Host = $targetHost; Desired = $desired; Ok = $false; Error = $null }
+            try {
+                Set-RDSessionHost -SessionHost $targetHost -ConnectionBroker $b -NewConnectionAllowed $desired -ErrorAction Stop
+                $r.Ok = $true
+            } catch {
+                $r.Error = $_.Exception.Message
+            }
+            return $r
         }
-        $out.SetResults += $r
+        $jobs = @()
+        try {
+            foreach ($item in $items) {
+                $ps = [powershell]::Create()
+                $ps.RunspacePool = $pool
+                $null = $ps.AddScript($setScript).AddArgument($item.Host).AddArgument($broker).AddArgument($item.Desired)
+                $jobs += @{ Pipe = $ps; Handle = $ps.BeginInvoke(); Item = $item }
+            }
+            foreach ($job in $jobs) {
+                try {
+                    $rs = @($job.Pipe.EndInvoke($job.Handle))[0]
+                    $out.SetResults += $rs
+                } catch {
+                    $out.SetResults += @{ Host = $job.Item.Host; Desired = $job.Item.Desired; Ok = $false; Error = $_.Exception.Message }
+                } finally {
+                    try { $job.Pipe.Dispose() } catch { }
+                }
+            }
+        } finally {
+            try { $pool.Close()   } catch { }
+            try { $pool.Dispose() } catch { }
+        }
     }
 
     # 2. Re-read the collection. This is both the verification source (compare
