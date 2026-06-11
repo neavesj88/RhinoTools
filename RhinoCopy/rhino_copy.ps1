@@ -948,6 +948,14 @@ try {
 
         # Build /COPY flag from radio selection. Default to DAT.
         $copyFlags = if ($radioCopyMinimal.Checked) { "D" } elseif ($radioCopyStandard.Checked) { "DAT" } elseif ($radioCopySecure.Checked) { "DATS" } elseif ($radioCopyFull.Checked) { "DATSO" } else { "DAT" }
+        # /DCOPY only accepts D|A|T|E|X - it rejects S (security) and O (owner)
+        # which are valid for /COPY but not for directories. Passing
+        # /DCOPY:DATS or /DCOPY:DATSO causes robocopy to bail with
+        # "ERROR : Invalid Parameter" (exit 16) before copying anything,
+        # which is what broke the Secure and Full presets. Filter the /COPY
+        # set down to the flags /DCOPY actually understands.
+        $dcopyFlags = ($copyFlags -replace '[^DAT]', '')
+        if (-not $dcopyFlags) { $dcopyFlags = "DA" }
         $recurseFlag = if ($radioModeMirror.Checked) { "/MIR" } else { "/E" }
 
         # Build robocopy command and run as a real child process.
@@ -956,7 +964,7 @@ try {
         # that previously crashed the host. The user-facing log (when ticked)
         # is also robocopy's own /LOG+ output, written to the destination.
         $progressLog = Join-Path $env:TEMP "RhinoCopy_progress_$([Guid]::NewGuid().ToString('N')).log"
-        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$copyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10", "/NP", "/NDL", "/UNILOG:$progressLog")
+        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$dcopyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10", "/NP", "/NDL", "/UNILOG:$progressLog")
         if ($radioPerformance.Checked) { $rcArgs += "/MT:18" } elseif ($radioRestricted.Checked) { $rcArgs += "/MT:9" } elseif ($radioSuperRestricted.Checked) { $rcArgs += "/MT:4" }
         # User-facing log (separate from the polling log written to %TEMP%).
         $userLogFile = $null
@@ -1124,8 +1132,11 @@ try {
     # because a user pasting this into cmd probably wants full output.
     function Generate-Command {
         $copyFlags = if ($radioCopyMinimal.Checked) { "D" } elseif ($radioCopyStandard.Checked) { "DAT" } elseif ($radioCopySecure.Checked) { "DATS" } elseif ($radioCopyFull.Checked) { "DATSO" } else { "DAT" }
+        # Same /DCOPY filter as Execute-Copy - see comments there.
+        $dcopyFlags = ($copyFlags -replace '[^DAT]', '')
+        if (-not $dcopyFlags) { $dcopyFlags = "DA" }
         $recurseFlag = if ($radioModeMirror.Checked) { "/MIR" } else { "/E" }
-        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$copyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10")
+        $rcArgs = @($txtSource.Text, $txtDest.Text, "*.*", "/COPY:$copyFlags", "/DCOPY:$dcopyFlags", $recurseFlag, "/XJ", "/W:1", "/R:10")
         if ($radioPerformance.Checked) { $rcArgs += "/MT:18" } elseif ($radioRestricted.Checked) { $rcArgs += "/MT:9" } elseif ($radioSuperRestricted.Checked) { $rcArgs += "/MT:4" }
         if ($chkLog.Checked) {
             $logFile = Join-Path $txtDest.Text "RhinoCopy_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
@@ -1178,7 +1189,10 @@ COPY OPTIONS
                   O = Owner info
                   U = aUditing info
                 Default is /COPY:DAT.
-  /DCOPY:flags  Same flag set, but applied to directories. Default DA.
+  /DCOPY:flags  What to copy for directories. NOTE: accepts a DIFFERENT
+                flag set to /COPY - only D, A, T, E, X are valid here.
+                Passing S or O (valid for /COPY) causes robocopy to fail
+                with "Invalid Parameter". Default is /DCOPY:DA.
   /COPYALL      Equivalent to /COPY:DATSOU. Copies everything.
   /NOCOPY       Copy nothing (useful with /PURGE to just delete extras).
   /SECFIX       Fix file security on all files, even skipped ones.
