@@ -96,12 +96,10 @@
       "issued" not "delivered" and the activity log captures the body so
       there's an audit trail regardless.
     - Closing the window while a destructive action is mid-flight triggers
-      a confirmation prompt. Sign-out runs in a background runspace with a
-      UI-thread Timer polling for completion, so the message pump stays
-      alive during logoff.exe and FormClosing actually fires. Send Message
-      runs synchronously but msg.exe is short-lived so the message pump is
-      blocked only briefly. Abandoned actions get an "ABANDONED" line in
-      the activity log.
+      a confirmation prompt. The action's outer wrapper tracks itself via
+      $script:actionInFlight; the FormClosing handler reads that and
+      vetoes the close (via $_.Cancel = $true) until the user confirms.
+      Abandoned actions get an "ABANDONED" line in the activity log.
 ================================================================================
 #>
 
@@ -546,24 +544,9 @@ function Get-RhinoOUs {
 
 # 5b - Get-RhinoServers
 # ---------------------
-# Enumerate computer objects (RDS hosts) under an LDAP path. Returns an
-# array of computer names (just the `name` attribute, not full DNs - the
-# names are what quser /server expects).
-#
-# Uses SearchScope.Subtree by default because some MSP clients have their
-# RDS hosts nested one OU level deeper than others (e.g. .../ClientX/
-# Production/RDS vs just .../ClientX/RDS) and we want both layouts to
-# work without a per-client config.
-#
-# PropertiesToLoad is restricted to "name" only. Without that restriction
-# AD returns the full property set per computer object (~100 attributes
-# each) and the wire payload becomes meaningful on big OUs.
-#
-# Disposal of the SearchResultCollection, DirectorySearcher and
-# DirectoryEntry is in a finally block - these wrap COM objects and
-# leaking them across many calls in a long-lived host accumulates handles.
-# Failures are logged (when Write-RhinoLog is defined) but otherwise
-# swallowed; an empty list is a valid return for "no servers found".
+# List computer objects (servers) under one OU. Default SearchScope is
+# Subtree which is what we want - some clients have their RDS hosts nested
+# one more level deep.
 function Get-RhinoServers {
     param([string]$adPath)
     $serverList = @()
@@ -863,8 +846,14 @@ function Parse-QuserOutput {
 
         try {
             $username    = $clean.Substring($colUser,  $colSess  - $colUser ).Trim()
-            $sessionName = $clean.Substring($colSess,  $colId    - $colSess ).Trim()
-            $idText      = $clean.Substring($colId,    $colState - $colId   ).Trim()
+            # ID is right-aligned by quser, so a 3+ digit ID overflows LEFT of
+            # $colId and a fixed slice at $colId clips the leading digit (127 -> 27,
+            # 109 -> 09). Take the whole SESSIONNAME..STATE region and split: the ID
+            # is always the last token, the session name (if any) is everything before.
+            $mid         = $clean.Substring($colSess, $colState - $colSess).Trim()
+            $midParts    = @($mid -split '\s+' | Where-Object { $_ -ne '' })
+            $idText      = if ($midParts.Count -ge 1) { $midParts[-1] } else { "" }
+            $sessionName = if ($midParts.Count -ge 2) { ($midParts[0..($midParts.Count - 2)] -join ' ') } else { "" }
             $state       = $clean.Substring($colState, $colIdle  - $colState).Trim()
             $idleTime    = $clean.Substring($colIdle,  $colLogon - $colIdle ).Trim()
             $logonTime   = $clean.Substring($colLogon).Trim()
@@ -966,8 +955,13 @@ function Get-RhinoSessions {
                 if ($clean.Length -lt ($colLogon + 1)) { continue }
                 try {
                     $username    = $clean.Substring($colUser,  $colSess  - $colUser ).Trim()
-                    $sessionName = $clean.Substring($colSess,  $colId    - $colSess ).Trim()
-                    $idText      = $clean.Substring($colId,    $colState - $colId   ).Trim()
+                    # ID is right-aligned by quser, so a 3+ digit ID overflows LEFT
+                    # of $colId and a fixed slice clips the leading digit (127 -> 27).
+                    # Split the SESSIONNAME..STATE region: ID is the last token.
+                    $mid         = $clean.Substring($colSess, $colState - $colSess).Trim()
+                    $midParts    = @($mid -split '\s+' | Where-Object { $_ -ne '' })
+                    $idText      = if ($midParts.Count -ge 1) { $midParts[-1] } else { "" }
+                    $sessionName = if ($midParts.Count -ge 2) { ($midParts[0..($midParts.Count - 2)] -join ' ') } else { "" }
                     $state       = $clean.Substring($colState, $colIdle  - $colState).Trim()
                     $idleTime    = $clean.Substring($colIdle,  $colLogon - $colIdle ).Trim()
                     $logonTime   = $clean.Substring($colLogon).Trim()
@@ -1134,13 +1128,13 @@ try {
     # synchronous blocking work, and clear it in their finally. The
     # FormClosing handler reads it to decide whether to prompt the user
     # before closing.
-    # Sign Out specifically runs in a background runspace polled by a
-    # WinForms Timer (see Invoke-SignOut). $script:asyncTimers tracks any
-    # such active timers so FormClosing can stop them cleanly on close-
-    # anyway - otherwise a Tick after form disposal crashes trying to
-    # access disposed controls.
+    # This doesn't catch the case where the UI thread is hard-stuck inside
+    # Start-Process -Wait (FormClosing can't fire while the message pump is
+    # blocked) - but it DOES catch the window where the action's outer
+    # wrapper is mid-flight and the pump briefly comes back up between the
+    # blocking call and the post-action verification. That's the realistic
+    # scenario: an action that takes a few seconds rather than truly hangs.
     $script:actionInFlight = $null
-    $script:asyncTimers = @()
 
     # FormClosing handler:
     #   1. If a destructive action is in flight, prompt the user with a
@@ -1162,15 +1156,6 @@ try {
                 $_.Cancel = $true
                 return
             }
-            # Stop any active async-action timers so their next Tick doesn't
-            # fire against this disposed form's controls. The runspaces
-            # themselves keep running until the underlying OS process (e.g.
-            # logoff.exe) finishes - which is fine, they don't reference
-            # the form.
-            foreach ($t in $script:asyncTimers) {
-                try { $t.Stop(); $t.Dispose() } catch { }
-            }
-            $script:asyncTimers = @()
             # Record the abandonment in the audit log before we lose the
             # textbox handle to disposal below.
             try {
@@ -1703,27 +1688,9 @@ try {
         try { Add-Content -Path $activityLog -Value $line -Encoding UTF8 } catch { }
     }
 
-    # Repopulate the sessionsGrid from $script:currentSessions, applying
-    # the live filter from $filterTextBox if one is set.
-    #
-    # The grid is the SOURCE OF TRUTH FOR THE USER but $script:currentSessions
-    # is the SOURCE OF TRUTH FOR THE DATA. Whenever currentSessions changes
-    # (query completes, row deleted after sign-out) we call this to push the
-    # updated data into the grid. The filter textbox's TextChanged also
-    # calls this on every keystroke for live filtering.
-    #
-    # Filter semantics:
-    #   - Case-insensitive substring match.
-    #   - Matches against Username, Server, State, and ClientName (the local
-    #     PC the user RDP'd from). Includes ClientName specifically so the
-    #     IT operator can filter the grid by "I'm on LAPTOP-42" without
-    #     having to scroll to find that workstation.
-    #   - Uses .Contains() not -like so '*' and '?' in the filter text are
-    #     treated as literal characters rather than wildcards.
-    #
-    # Updates the countLabel ("X of Y sessions" when filtered, "X sessions"
-    # otherwise) so the operator can see at a glance how many rows the
-    # current filter is hiding.
+    # Repopulate the grid from $script:currentSessions, optionally filtered
+    # by the text in $filterTextBox. Called by both the query functions
+    # (after they update currentSessions) and the filter TextChanged event.
     function Apply-SessionFilter {
         $filter = $filterTextBox.Text.Trim().ToLower()
         $sessionsGrid.Rows.Clear()
@@ -1766,34 +1733,9 @@ try {
     # Live filter as the user types.
     $filterTextBox.Add_TextChanged({ Apply-SessionFilter })
 
-    # The PRIMARY workflow function: given a username (or partial), find
-    # every active session for that user across the RDS estate.
-    #
-    # Pipeline:
-    #   1. Read username from $usernameTextBox. Empty -> warn and return.
-    #   2. Resolve scope. If the Quick Find scope dropdown has a client
-    #      picked, we use that client's tenant DN for the AD search and
-    #      that client's matching RDS server OU for the server enumeration.
-    #      If scope is empty, AD search is domain-wide and server enum is
-    #      every RDS host under $script:rdsServerRoot.
-    #   3. AD search: Resolve-RhinoUsernames returns matching SAMs and UPNs.
-    #      If AD returns nothing we fall back to wildcard matching on raw
-    #      quser usernames - the search still works, just without UPN
-    #      enrichment.
-    #   4. Server enumeration: Get-RhinoServers (scoped) or Get-AllRhinoServers
-    #      (everything). If the unscoped count is large enough we prompt
-    #      before proceeding so accidental "search everywhere" can be
-    #      cancelled.
-    #   5. Get-RhinoSessions runs quser against every server in parallel
-    #      via the runspace pool. This is the bulk of the wait time and
-    #      includes per-session WTS ClientName lookups.
-    #   6. Filter the combined results to matching usernames (AD-resolved
-    #      SAMs, or wildcard fallback). Error-marker rows from failed
-    #      servers are PRESERVED so failures surface in the grid rather
-    #      than being silently dropped.
-    #   7. Push to currentSessions, refresh the grid, log a summary.
-    # If exactly one match, the row is auto-selected so the operator can
-    # press Sign Out or Shadow without further clicks.
+    # Search across every RDS server for the username in the textbox.
+    # Bulk of the wait time is in Get-RhinoSessions; everything else here
+    # is bookkeeping and UI updates.
     function Find-UserEverywhere {
         $query = $usernameTextBox.Text.Trim()
         if (-not $query) {
@@ -1875,8 +1817,12 @@ try {
             # wait cursor is reset before the dialog opens so the user
             # isn't staring at an hourglass while deciding.
             if (-not $scopedClient -and $servers.Count -ge 30) {
+                $est = [Math]::Ceiling($servers.Count / 15) * 2
                 $form.Cursor = [System.Windows.Forms.Cursors]::Default
-                $confirmMsg = "Are you sure you want to search '$query' across ALL $($servers.Count) servers? This may take a while."
+                $confirmMsg  = "You are about to search '$query' across $($servers.Count) RDS servers spanning every client.`n`n"
+                $confirmMsg += "With 15 parallel threads this typically takes around $est seconds and the UI will be unresponsive during that time.`n`n"
+                $confirmMsg += "If you only need to find the user inside one client, click No and pick that client from the scope dropdown first.`n`n"
+                $confirmMsg += "Proceed with the full search?"
                 $ans = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "RhinoShadow - Confirm Large Search", 'YesNo', 'Warning')
                 if ($ans -ne 'Yes') {
                     Write-RhinoLog "Large search cancelled by user. Pick a client from the scope dropdown to narrow it." "warn"
@@ -1946,24 +1892,11 @@ try {
         }
     }
 
-    # The SECONDARY workflow function: show every active session on a
-    # specific set of RDS hosts, regardless of who's logged in.
-    #
-    # Used when the operator already knows which servers they care about
-    # (e.g. pre-restart sweeps, "everyone on PER-SH118 right now",
-    # investigating a specific host's load). The Browse panel's checklist
-    # is the input - any ticked servers get queried.
-    #
-    # Differences from Find-UserEverywhere:
-    #   - No username filter. Every session on every ticked server appears
-    #     in the grid.
-    #   - No AD-side user resolution upfront. UPN enrichment is done
-    #     reactively via Get-UPNMap after the quser results come in -
-    #     one bulk AD query for every SAM in the result set, not one per
-    #     user.
-    #   - Error markers from failed servers are shown in the grid as
-    #     ERROR rows, with the failure reason in the LogonTime cell.
-    # As with Find, the heavy lifting is parallel quser via Get-RhinoSessions.
+    # Query sessions for whichever servers are ticked in the Browse panel.
+    # Unlike Find-UserEverywhere this doesn't filter by username - it shows
+    # EVERY session on the selected servers. UPNs are bulk-resolved via
+    # Get-UPNMap (one AD query covering every SAM in the result set) so the
+    # grid can show the friendly UPN alongside the SAM.
     function Show-SessionsForSelectedServers {
         $checked = @($serverListBox.CheckedItems)
         if ($checked.Count -eq 0) {
@@ -1972,10 +1905,7 @@ try {
         }
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         try {
-            # Sort and join the chosen server names so the audit log records
-            # exactly which hosts were queried, not just how many.
-            $serverList = ($checked | Sort-Object) -join ", "
-            Write-RhinoLog "Querying $($checked.Count) selected server(s): $serverList"
+            Write-RhinoLog "Querying $($checked.Count) selected server(s)..."
             $allSessions = Get-RhinoSessions -Servers $checked
             # Bulk-resolve UPNs for all SAM accounts in the result set using
             # a single AD query rather than one per user.
@@ -2055,24 +1985,9 @@ try {
         if ($s.ClientName) { return " from $($s.ClientName)" } else { return "" }
     }
 
-    # Launch mstsc.exe in shadow mode against the selected session. The
-    # operator gets a live view of the user's desktop and (with /control)
-    # full keyboard + mouse input - the standard helpdesk takeover.
-    #
-    # Design choices worth knowing:
-    #   - /control is included for full input control. Drop it for view-
-    #     only shadowing if your environment requires it (some compliance
-    #     setups do).
-    #   - The target session must be in the Active state. quser reports
-    #     "Disc" for disconnected sessions and mstsc can't shadow those
-    #     because there's no live display surface. We check up front and
-    #     warn rather than letting mstsc fail opaquely.
-    #   - We rely on the SHADOW GPO at the RDS host end to control whether
-    #     the user sees a consent prompt. RhinoShadow doesn't (and can't)
-    #     override that policy.
-    #   - Unlike Sign Out, this is FIRE AND FORGET. No async runspace,
-    #     no exit-code check. mstsc launches its own GUI process and
-    #     manages its own lifetime; we just kick it off and move on.
+    # Shadow a session via mstsc. /control gives you full keyboard+mouse,
+    # which is what helpdesk-style shadowing normally wants. Drop /control
+    # for view-only.
     function Invoke-Shadow {
         $s = Get-SelectedSession
         if (-not $s) { return }
@@ -2096,21 +2011,10 @@ try {
     # we re-query the server for that session ID and confirm it really did
     # disappear before we report success.
     #
-    # ASYNC EXECUTION:
-    # The logoff + verification runs in a background runspace, NOT on the
-    # UI thread. A WinForms Timer polls $handle.IsCompleted every 200ms and
-    # finalises the operation when the runspace finishes. This keeps the
-    # UI message pump alive during the wait, which is important because:
-    #   1. The user can still interact with other parts of the app
-    #      (filter the grid, look at the log) while it runs.
-    #   2. If they click X mid-action, the FormClosing handler can actually
-    #      fire and show the "action in flight" warning. Previously the
-    #      synchronous Start-Process -Wait would block the message pump,
-    #      Windows would mark the form as "Not Responding", and FormClosing
-    #      would only fire after the wait returned.
-    #
-    # $script:actionInFlight is set while the runspace is in progress and
-    # cleared when it completes (or when the user confirms close-anyway).
+    # $script:actionInFlight is set for the duration of the blocking work
+    # (logoff.exe + verification re-query). Cleared in finally so a thrown
+    # exception doesn't leave the flag stuck on. The FormClosing handler
+    # uses this to prompt if the user tries to close mid-action.
     function Invoke-SignOut {
         $s = Get-SelectedSession
         if (-not $s) { return }
@@ -2118,132 +2022,61 @@ try {
         $ans = [System.Windows.Forms.MessageBox]::Show($msg, "RhinoShadow - Sign Out", 'YesNo', 'Warning')
         if ($ans -ne 'Yes') { return }
         $script:actionInFlight = "signing out $($s.Username) on $($s.Server)"
+        try {
+            # Call logoff.exe explicitly to avoid the PowerShell alias collision.
+            # Wait for exit so we can verify directly afterwards.
+            $p = Start-Process -FilePath "logoff.exe" -ArgumentList "$($s.SessionID)", "/server:$($s.Server)" -Wait -PassThru -NoNewWindow
+            if ($p.ExitCode -ne 0) { throw "logoff.exe exited with code $($p.ExitCode)" }
 
-        # Disable destructive buttons during the operation so the user
-        # can't queue a second action on top.
-        $signOutButton.Enabled = $false
-        $sendMsgButton.Enabled = $false
-
-        # The runspace runs everything that would otherwise have blocked
-        # the UI thread: logoff.exe (synchronous wait), 500ms settle, and
-        # the verification quser. Returns a hashtable that the UI thread
-        # turns into log messages and grid updates after IsCompleted.
-        $workScript = {
-            param($sessionId, $server)
-            $result = @{ Success = $false; StillThere = $false; ErrorMessage = $null }
-            # Capture stderr to a temp file so we get the human-readable
-            # reason ("Access is denied", "The RPC server is unavailable",
-            # etc) when logoff.exe fails. Without this we only get the
-            # exit code, which is uniformly 1 for almost every failure
-            # mode and useless for diagnosis.
-            $errFile = [System.IO.Path]::GetTempFileName()
+            # Verify by re-querying. Small delay first since logoff can be
+            # asynchronous server-side - quser immediately after sometimes
+            # still sees the session in a transitional state.
+            Start-Sleep -Milliseconds 500
+            $stillThere = $false
             try {
-                $p = Start-Process -FilePath "logoff.exe" -ArgumentList "$sessionId", "/server:$server" -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile
-                if ($p.ExitCode -ne 0) {
-                    $stderr = ""
-                    try { $stderr = (Get-Content -Path $errFile -Raw -ErrorAction Stop).Trim() } catch { }
-                    if ($stderr) {
-                        $result.ErrorMessage = "logoff.exe (code $($p.ExitCode)): $stderr"
-                    } else {
-                        $result.ErrorMessage = "logoff.exe exited with code $($p.ExitCode)"
-                    }
-                    return $result
-                }
-                Start-Sleep -Milliseconds 500
-                try {
-                    $verify = query user /server:$server 2>$null
-                    if ($verify) {
-                        $escaped = [regex]::Escape($sessionId)
-                        foreach ($line in $verify) {
-                            if ($line -match "\s$escaped\s") {
-                                $result.StillThere = $true
-                                break
-                            }
+                $verify = query user /server:$($s.Server) 2>$null
+                if ($verify) {
+                    foreach ($line in $verify) {
+                        # Only need a coarse match - is THIS session ID still listed?
+                        # The session ID appears as a standalone token in the line.
+                        if ($line -match "\s$([regex]::Escape($s.SessionID))\s") {
+                            $stillThere = $true
+                            break
                         }
                     }
-                    $result.Success = $true
-                } catch {
-                    $result.ErrorMessage = "Verification failed: $_"
                 }
             } catch {
-                $result.ErrorMessage = "$_"
-            } finally {
-                try { Remove-Item -Path $errFile -Force -ErrorAction SilentlyContinue } catch { }
+                # Verification itself failed - can't be sure. Treat as ambiguous
+                # rather than success or failure.
+                Write-RhinoLog "Sign-out issued for $($s.Username) on $($s.Server) but verification failed: $_" "warn"
+                return
             }
-            return $result
-        }
-        $ps = [powershell]::Create()
-        $null = $ps.AddScript($workScript).AddArgument($s.SessionID).AddArgument($s.Server)
-        $asyncHandle = $ps.BeginInvoke()
-
-        # Timer polls for completion on the UI thread. 200ms keeps it
-        # snappy without burning cycles.
-        $timer = New-Object System.Windows.Forms.Timer
-        $timer.Interval = 200
-        # Stash everything the Tick handler needs into Tag so the closure
-        # doesn't have to capture script-scoped variables across the boundary.
-        $timer.Tag = @{
-            Pipe       = $ps
-            Handle     = $asyncHandle
-            Session    = $s
-        }
-        # Track this timer so FormClosing can stop it on close-anyway -
-        # otherwise the Tick after disposal would crash on disposed controls.
-        $script:asyncTimers += $timer
-        $timer.Add_Tick({
-            $state = $this.Tag
-            if (-not $state.Handle.IsCompleted) { return }
-            $this.Stop()
-            $sess = $state.Session
-            try {
-                $r = $state.Pipe.EndInvoke($state.Handle)
-                if ($r.ErrorMessage) {
-                    Write-RhinoLog "Sign-out failed: $($r.ErrorMessage)" "error"
-                } elseif (-not $r.Success) {
-                    Write-RhinoLog "Sign-out issued for $($sess.Username) on $($sess.Server) but verification was inconclusive." "warn"
-                } elseif ($r.StillThere) {
-                    Write-RhinoLog "Sign-out for $($sess.Username) on $($sess.Server) reported success but session $($sess.SessionID) is still active. Check permissions or session state." "error"
-                } else {
-                    Write-RhinoLog "Sign-out confirmed: $($sess.Username) on $($sess.Server) (session $($sess.SessionID))$(Get-ClientNameSuffix $sess)." "ok"
-                    $script:currentSessions = @($script:currentSessions | Where-Object {
-                        -not ($_.Server -eq $sess.Server -and $_.SessionID -eq $sess.SessionID)
-                    })
-                    Apply-SessionFilter
-                }
-            } catch {
-                Write-RhinoLog "Sign-out post-processing failed: $_" "error"
-            } finally {
-                try { $state.Pipe.Dispose() } catch { }
-                # Remove from the tracking array before disposing so we
-                # don't accumulate dead references.
-                $script:asyncTimers = @($script:asyncTimers | Where-Object { $_ -ne $this })
-                $this.Dispose()
-                $script:actionInFlight = $null
-                $signOutButton.Enabled = $true
-                $sendMsgButton.Enabled = $true
+            if ($stillThere) {
+                # logoff.exe returned 0 but the session is still there. This
+                # is the documented Server 2019 silent-fail case.
+                Write-RhinoLog "Sign-out for $($s.Username) on $($s.Server) reported success but session $($s.SessionID) is still active. Check permissions or session state." "error"
+                return
             }
-        })
-        Write-RhinoLog "Sign-out dispatched for $($s.Username) on $($s.Server) - waiting for confirmation..."
-        $timer.Start()
+            Write-RhinoLog "Sign-out confirmed: $($s.Username) on $($s.Server) (session $($s.SessionID))$(Get-ClientNameSuffix $s)." "ok"
+            $script:currentSessions = @($script:currentSessions | Where-Object {
+                -not ($_.Server -eq $s.Server -and $_.SessionID -eq $s.SessionID)
+            })
+            Apply-SessionFilter
+        } catch {
+            Write-RhinoLog "Sign-out failed: $_" "error"
+        } finally {
+            $script:actionInFlight = $null
+        }
     }
 
     # Send a pop-up message to the selected session via msg.exe. Prompts
-    # for the message body with a small custom dialog.
+    # for the message body with a small input dialog.
     #
     # Caveat: msg.exe's exit code is unreliable like logoff.exe's - it can
     # return 0 even when the message wasn't actually delivered (no console
     # session, RPC blocked, session too stale to receive). Unlike sign-out
     # there is no server-side way to verify delivery, so we trust the exit
-    # code and log it as "issued" rather than "confirmed". The full message
-    # body is recorded in the activity log on a second line so the audit
-    # trail captures what was sent regardless of delivery.
-    #
-    # Why this runs SYNCHRONOUSLY while Sign Out runs ASYNC:
-    # msg.exe is short-lived - it queues the message via RPC and returns
-    # within a fraction of a second. The blocking wait is negligible and
-    # not worth the runspace+timer plumbing that Sign Out needs. If a
-    # specific deployment finds msg.exe hanging for long enough to be a
-    # problem, lift the async pattern from Invoke-SignOut into here.
+    # code and log it as "issued" rather than "confirmed".
     function Invoke-SendMessage {
         $s = Get-SelectedSession
         if (-not $s) { return }
@@ -2314,26 +2147,12 @@ try {
         if (-not $body) { return }
 
         $script:actionInFlight = "sending a message to $($s.Username) on $($s.Server)"
-        # Temp file captures msg.exe stderr so we can include the human-
-        # readable error ("Access is denied", "Error 1722 The RPC server
-        # is unavailable", "Error 5 access is denied", etc) in the activity
-        # log. Exit code 1 alone is uniform across every msg.exe failure
-        # mode and not useful for diagnosis.
-        $errFile = [System.IO.Path]::GetTempFileName()
         try {
             # msg.exe args: session ID, /server switch, then the message text.
             # The message must be passed as a single quoted token so spaces
             # inside the text don't get split into separate arguments.
-            $p = Start-Process -FilePath "msg.exe" -ArgumentList "$($s.SessionID)", "/server:$($s.Server)", "`"$body`"" -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile
-            if ($p.ExitCode -ne 0) {
-                $stderr = ""
-                try { $stderr = (Get-Content -Path $errFile -Raw -ErrorAction Stop).Trim() } catch { }
-                if ($stderr) {
-                    throw "msg.exe (code $($p.ExitCode)): $stderr"
-                } else {
-                    throw "msg.exe exited with code $($p.ExitCode)"
-                }
-            }
+            $p = Start-Process -FilePath "msg.exe" -ArgumentList "$($s.SessionID)", "/server:$($s.Server)", "`"$body`"" -Wait -PassThru -NoNewWindow
+            if ($p.ExitCode -ne 0) { throw "msg.exe exited with code $($p.ExitCode)" }
             # Flatten whitespace in the body so multi-line or tab-containing
             # messages don't break the activity log's one-line-per-entry
             # format. The full text is preserved in $body for msg.exe itself;
@@ -2348,27 +2167,12 @@ try {
         } catch {
             Write-RhinoLog "Message send failed: $_" "error"
         } finally {
-            try { Remove-Item -Path $errFile -Force -ErrorAction SilentlyContinue } catch { }
             $script:actionInFlight = $null
         }
     }
 
-    # Re-run whichever query type last populated the grid.
-    #
-    # $script:lastQueryMode is set by the click handlers of Find Everywhere
-    # ("find") and Show Sessions ("browse") to remember which mode the
-    # operator was using. Refresh just dispatches to the right function
-    # based on that state.
-    #
-    # If neither has run yet (lastQueryMode is $null), we warn rather than
-    # silently doing nothing - the operator was probably expecting SOMETHING
-    # to happen and "nothing happens" is the worst UX.
-    #
-    # Refresh deliberately re-uses the current state of the search fields
-    # (username textbox, scope dropdown, ticked servers) rather than
-    # capturing them at the time of original query. This is what the
-    # operator usually wants: "show me the current state of what I was
-    # just looking at".
+    # Refresh re-runs whichever query last populated the grid. We track
+    # this via $script:lastQueryMode = "find" | "browse".
     $script:lastQueryMode = $null
     function Invoke-Refresh {
         switch ($script:lastQueryMode) {
@@ -2444,17 +2248,6 @@ try {
     # ------------------------------------------------------------------
     # SECTION 6j - Help dialog
     # ------------------------------------------------------------------
-    # Build and show a modal help window with workflow walkthroughs, tips,
-    # action descriptions, and config notes. Built fresh on every call
-    # rather than cached because it's infrequent (one-off click) and
-    # building once-then-reuse complicates the lifecycle (theme changes
-    # mid-session would leave the cached help dialog in the wrong palette).
-    #
-    # Content lives in a here-string below and uses RichTextBox with
-    # WordWrap=false because the workflow steps and column tables read
-    # better at their natural widths than hard-wrapped at the dialog edge.
-    # An earlier version used a TextBox which compressed the layout in
-    # ways the original author didn't intend.
     function Show-RhinoHelp {
         $h = New-Object System.Windows.Forms.Form
         $h.Text = "RhinoShadow - Help"
@@ -2476,14 +2269,6 @@ try {
         $body.BackColor = $script:t.Surface
         $body.ForeColor = $script:t.Text
         $body.Font = $fontRegular
-        # Expanding here-string @"..."@ so PowerShell substitutes
-        # $script:clientRoot / $script:rdsServerRoot with their actual
-        # configured values when the dialog is shown. The whole point of
-        # the CONFIGURATION section in the help is to tell whoever is
-        # looking at it what THIS deployment is currently pointing at,
-        # so they don't have to scroll back up to Section 4. Nothing
-        # else in the body contains $-prefixed text that would be
-        # misinterpreted, so expansion is safe.
         $body.Text = @"
 RhinoShadow - Quick Guide
 ==========================
@@ -2550,14 +2335,16 @@ ACTIONS
 CLOSING THE WINDOW
 ------------------
 If you click the X (or Alt+F4) while a Sign Out or Send Message is still
-running, RhinoShadow will ask you to confirm before closing. Closing
-mid-action leaves an "ABANDONED" entry in the activity log marking that
-the action's outcome is unknown.
+running, RhinoShadow will ask you to confirm before closing. The action
+might take a few seconds (logoff.exe + verification re-query, or msg.exe
+delivery) and closing mid-action leaves an "ABANDONED" entry in the
+activity log marking that the action's outcome is unknown.
 
-Sign Out runs in a background runspace so the form stays responsive
-during logoff.exe - you can keep using the rest of the app while it
-waits. Send Message blocks briefly during msg.exe (it's short-lived,
-unlike logoff) but the same guard applies if you do try to close.
+Note: this guard only catches close attempts that arrive between operations.
+If logoff.exe or msg.exe is truly hung on a dead RPC connection, the UI
+thread is blocked and your X click is queued until the operation gives up
+or times out at the OS level. In that case there's nothing to confirm -
+you'll just see the form become responsive eventually and close normally.
 
 LOG FILES
 ---------
@@ -2574,25 +2361,20 @@ LOG FILES
 
 CONFIG
 ------
-RhinoShadow uses two AD locations set inside the CONFIGURATION banner
-block near the top of the script (look for the >>> markers). The values
-shown below are what THIS INSTANCE is currently using - they will be
-different on other deployments depending on how the script was set up.
+RhinoShadow needs to know two AD locations, set near the top of the script
+inside the CONFIGURATION banner block (look for the >>> markers):
 
-  Client root (current value):
-    $script:clientRoot
-    Parent OU of your client tenants. Each direct child is one client.
-    Populates the Client dropdowns and scopes user account searches.
-
-  RDS server root (current value):
-    $script:rdsServerRoot
-    Parent OU of your RDS server folders. Each direct child should have
-    the same name as the matching client's tenant OU.
+  $script:clientRoot     - parent OU of your client tenants. Each direct
+                           child is one client. Populates the dropdowns
+                           and scopes user account searches.
+  $script:rdsServerRoot  - parent OU of your RDS server folders. Each
+                           direct child should have the same name as the
+                           matching client's tenant OU.
 
 In single-tenant setups both variables point at the same OU. In MSP
 hosting layouts they point at different trees joined by matching client
-OU names. To move RhinoShadow between domains: edit those two lines in
-the script, save, relaunch.
+OU names. To move RhinoShadow between domains: update those two lines,
+save, relaunch.
 "@
         $h.Controls.Add($body)
         $h.ShowDialog() | Out-Null
